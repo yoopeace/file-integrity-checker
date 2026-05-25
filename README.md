@@ -75,4 +75,4 @@ python3 checker.py --verify ./검사할폴더
 ## 👤 개발자
 
 - GitHub: [yoopeace](https://github.com/yoopeace)
-- 전직 경찰관 출신 정보보안 전문가 지망생
+- 현직 경찰관 재직
