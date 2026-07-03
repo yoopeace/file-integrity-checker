@@ -100,6 +100,11 @@ def create_snapshot(directory: str) -> None:
     현재 상태(해시 딕셔너리)를 snapshot.json에 저장합니다.
     이것이 나중에 비교할 '기준선(baseline)'이 됩니다.
     """
+    if not os.path.isdir(directory):
+        print(f"\n❌ 폴더를 찾을 수 없습니다: {directory}")
+        print("   경로를 다시 확인해 주세요.\n")
+        return
+
     log.info(f"=== 스냅샷 생성 시작: {directory} ===")
     hashes = collect_hashes(directory)
 
@@ -131,14 +136,31 @@ def verify_integrity(directory: str) -> None:
         print("   먼저 --snapshot 옵션으로 기준선을 만들어 주세요.\n")
         return
 
-    log.info(f"=== 무결성 검증 시작: {directory} ===")
+    if not os.path.isdir(directory):
+        print(f"\n❌ 폴더를 찾을 수 없습니다: {directory}")
+        print("   경로를 다시 확인해 주세요.\n")
+        return
 
     # 저장된 스냅샷 불러오기
-    with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
-        snapshot_data = json.load(f)
-    
+    try:
+        with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+            snapshot_data = json.load(f)
+    except json.JSONDecodeError:
+        print(f"\n❌ 스냅샷 파일({SNAPSHOT_FILE})이 손상되어 읽을 수 없습니다.")
+        print("   --snapshot 옵션으로 다시 생성해 주세요.\n")
+        return
+
+    log.info(f"=== 무결성 검증 시작: {directory} ===")
+
     old_hashes = snapshot_data["files"]
     created_at  = snapshot_data.get("created_at", "알 수 없음")
+
+    # 검증 대상 폴더가 스냅샷 생성 당시 폴더와 다르면 경고
+    baseline_dir = snapshot_data.get("target_directory")
+    if baseline_dir and os.path.abspath(directory) != baseline_dir:
+        print(f"\n⚠️  주의: 스냅샷은 '{baseline_dir}' 폴더 기준으로 생성되었습니다.")
+        print(f"   현재 검증 대상('{os.path.abspath(directory)}')과 다릅니다. 결과 해석에 유의하세요.")
+        log.warning(f"  대상 폴더 불일치 - 스냅샷: {baseline_dir} / 검증: {os.path.abspath(directory)}")
 
     # 현재 상태의 해시 계산
     current_hashes = collect_hashes(directory)
@@ -213,9 +235,10 @@ def main():
         epilog="예시:\n  python checker.py --snapshot ./documents\n  python checker.py --verify ./documents",
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument("--snapshot", metavar="폴더경로",
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--snapshot", metavar="폴더경로",
                         help="지정 폴더의 스냅샷(기준선)을 생성합니다.")
-    parser.add_argument("--verify",   metavar="폴더경로",
+    group.add_argument("--verify",   metavar="폴더경로",
                         help="스냅샷과 현재 상태를 비교해 변조를 탐지합니다.")
 
     args = parser.parse_args()
