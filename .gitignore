@@ -3,3 +3,5 @@ snapshot.json
 integrity_log.txt
 test_folder/
 secret_docs/
+.integrity_key
+__pycache__/

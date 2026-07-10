@@ -10,8 +10,10 @@
 """
 
 import hashlib      # SHA-256 해시 계산
+import hmac         # 스냅샷 서명(위변조 방지)
 import json         # 스냅샷 저장/불러오기
 import os           # 파일/폴더 탐색
+import secrets      # 서명용 비밀키 생성
 import argparse     # 터미널 명령줄 옵션 처리
 import logging      # 로그 파일 기록
 from datetime import datetime  # 날짜/시간 기록
@@ -21,6 +23,7 @@ from datetime import datetime  # 날짜/시간 기록
 # ─────────────────────────────────────────
 SNAPSHOT_FILE = "snapshot.json"       # 해시 저장 파일 이름
 LOG_FILE      = "integrity_log.txt"   # 로그 파일 이름
+KEY_FILE      = ".integrity_key"      # 스냅샷 서명용 비밀키 파일 (유출 주의)
 
 # 로그 설정: 파일과 터미널 동시 출력
 logging.basicConfig(
@@ -72,8 +75,8 @@ def collect_hashes(directory: str) -> dict:
         dirs[:] = [d for d in dirs if not d.startswith(".")]
 
         for filename in files:
-            # 스냅샷/로그 파일 자체는 제외
-            if filename in (SNAPSHOT_FILE, LOG_FILE):
+            # 스냅샷/로그/키 파일 자체는 제외
+            if filename in (SNAPSHOT_FILE, LOG_FILE, KEY_FILE):
                 continue
 
             filepath = os.path.join(root, filename)
@@ -90,6 +93,39 @@ def collect_hashes(directory: str) -> dict:
                 log.error(f"  오류 발생: {relative_path} → {e}")
 
     return hashes
+
+
+# ─────────────────────────────────────────
+# 핵심 함수 3: 스냅샷 서명 (위변조 방지)
+# ─────────────────────────────────────────
+def load_or_create_key() -> str:
+    """
+    스냅샷 서명용 비밀키를 불러오거나, 없으면 새로 만듭니다.
+
+    공격자가 파일을 바꾼 뒤 snapshot.json까지 함께 조작하면
+    해시 비교만으로는 탐지할 수 없습니다.
+    비밀키로 스냅샷에 서명해 두면 스냅샷 자체의 위변조를 잡아낼 수 있습니다.
+    (단, 키 파일이 유출되면 무력화되므로 안전한 곳에 보관해야 합니다.)
+    """
+    if os.path.exists(KEY_FILE):
+        with open(KEY_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+
+    key = secrets.token_hex(32)   # 256비트 무작위 키
+    with open(KEY_FILE, "w", encoding="utf-8") as f:
+        f.write(key)
+    log.info(f"  서명용 비밀키 생성: {KEY_FILE}")
+    return key
+
+
+def compute_signature(snapshot_data: dict, key: str) -> str:
+    """
+    스냅샷 내용 전체에 대한 HMAC-SHA256 서명을 계산합니다.
+    signature 필드 자체는 계산에서 제외합니다.
+    """
+    payload = {k: v for k, v in snapshot_data.items() if k != "signature"}
+    message = json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hmac.new(key.encode("utf-8"), message, hashlib.sha256).hexdigest()
 
 
 # ─────────────────────────────────────────
@@ -114,6 +150,10 @@ def create_snapshot(directory: str) -> None:
         "file_count": len(hashes),
         "files": hashes
     }
+
+    # 스냅샷 자체의 위변조를 막기 위해 비밀키로 서명
+    key = load_or_create_key()
+    snapshot_data["signature"] = compute_signature(snapshot_data, key)
 
     with open(SNAPSHOT_FILE, "w", encoding="utf-8") as f:
         json.dump(snapshot_data, f, ensure_ascii=False, indent=2)
@@ -149,6 +189,25 @@ def verify_integrity(directory: str) -> None:
         print(f"\n❌ 스냅샷 파일({SNAPSHOT_FILE})이 손상되어 읽을 수 없습니다.")
         print("   --snapshot 옵션으로 다시 생성해 주세요.\n")
         return
+
+    # 스냅샷 자체가 위변조되지 않았는지 서명 확인
+    signature = snapshot_data.get("signature")
+    if signature is None:
+        print(f"\n⚠️  주의: 서명이 없는 스냅샷입니다 (구버전에서 생성).")
+        print("   스냅샷 자체의 위변조 여부는 확인할 수 없습니다.")
+        log.warning("  스냅샷에 서명 없음 - 위변조 검증 생략")
+    elif not os.path.exists(KEY_FILE):
+        print(f"\n⚠️  주의: 비밀키 파일({KEY_FILE})이 없어 스냅샷 서명을 검증할 수 없습니다.")
+        log.warning("  비밀키 파일 없음 - 서명 검증 생략")
+    else:
+        key = load_or_create_key()
+        expected = compute_signature(snapshot_data, key)
+        if not hmac.compare_digest(expected, signature):
+            print(f"\n🚨 경고: 스냅샷 파일({SNAPSHOT_FILE})의 서명이 일치하지 않습니다!")
+            print("   스냅샷 자체가 위변조되었을 가능성이 있어 검증을 중단합니다.")
+            print("   신뢰할 수 있는 기준선이 필요하면 --snapshot 으로 다시 생성해 주세요.\n")
+            log.error("  스냅샷 서명 불일치 - 위변조 의심, 검증 중단")
+            return
 
     log.info(f"=== 무결성 검증 시작: {directory} ===")
 
