@@ -190,6 +190,12 @@ def verify_integrity(directory: str) -> None:
         print("   --snapshot 옵션으로 다시 생성해 주세요.\n")
         return
 
+    # JSON은 유효해도 스냅샷 형식이 아니면 안내
+    if not isinstance(snapshot_data, dict) or not isinstance(snapshot_data.get("files"), dict):
+        print(f"\n❌ 스냅샷 파일({SNAPSHOT_FILE})의 형식이 올바르지 않습니다.")
+        print("   --snapshot 옵션으로 다시 생성해 주세요.\n")
+        return
+
     # 스냅샷 자체가 위변조되지 않았는지 서명 확인
     signature = snapshot_data.get("signature")
     if signature is None:

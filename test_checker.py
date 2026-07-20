@@ -89,6 +89,14 @@ class TestSnapshotSigning(unittest.TestCase):
         key = checker.load_or_create_key()
         self.assertEqual(data["signature"], checker.compute_signature(data, key))
 
+    def test_형식이_잘못된_스냅샷은_크래시_없이_안내(self):
+        with open(checker.SNAPSHOT_FILE, "w") as f:
+            f.write("{}")  # 유효한 JSON이지만 스냅샷 형식이 아님
+        try:
+            checker.verify_integrity("./docs")  # KeyError 없이 반환되어야 함
+        except KeyError:
+            self.fail("형식이 잘못된 스냅샷에서 KeyError가 발생함")
+
     def test_스냅샷_위변조_시_서명_불일치(self):
         checker.create_snapshot("./docs")
         with open(checker.SNAPSHOT_FILE) as f:
