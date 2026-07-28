@@ -73,7 +73,7 @@ python3 checker.py --verify ./검사할폴더
 
 ## 테스트
 
-pytest로 실행:
+전체 테스트(21건) 실행:
 
 ```bash
 python3 -m venv .venv
@@ -81,11 +81,13 @@ python3 -m venv .venv
 .venv/bin/pytest
 ```
 
-pytest 없이 표준 라이브러리만으로 실행:
+pytest 없이 실행 (서명 관련 9건만 해당):
 
 ```bash
 python3 -m unittest test_checker
 ```
+
+`test_hashing.py`는 pytest 기능을 사용하므로 pytest로만 실행됨.
 
 `main` 브랜치에 push하거나 PR을 올리면 GitHub Actions에서 테스트가 자동 실행됨.
 
