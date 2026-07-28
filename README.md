@@ -1,5 +1,7 @@
 # 🔍 파일 무결성 검사기 (File Integrity Checker)
 
+[![CI](https://github.com/yoopeace/file-integrity-checker/actions/workflows/ci.yml/badge.svg)](https://github.com/yoopeace/file-integrity-checker/actions/workflows/ci.yml)
+
 SHA-256 해시를 이용해 파일의 변조, 삭제, 추가 여부를 탐지하는 도구.
 
 ---
@@ -71,9 +73,21 @@ python3 checker.py --verify ./검사할폴더
 
 ## 테스트
 
+pytest로 실행:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install pytest
+.venv/bin/pytest
+```
+
+pytest 없이 표준 라이브러리만으로 실행:
+
 ```bash
 python3 -m unittest test_checker
 ```
+
+`main` 브랜치에 push하거나 PR을 올리면 GitHub Actions에서 테스트가 자동 실행됨.
 
 ---
 

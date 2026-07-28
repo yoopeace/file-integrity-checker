@@ -5,3 +5,5 @@ test_folder/
 secret_docs/
 .integrity_key
 __pycache__/
+.venv/
+.pytest_cache/

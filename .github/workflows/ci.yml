@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 저장소 코드 내려받기
+        uses: actions/checkout@v5
+
+      - name: 파이썬 설치
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: pytest 설치
+        run: pip install pytest
+
+      - name: 테스트 실행
+        run: pytest -v
