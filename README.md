@@ -73,7 +73,7 @@ python3 checker.py --verify ./검사할폴더
 
 ## 테스트
 
-전체 테스트(21건) 실행:
+전체 테스트(21건 = pytest 12건 + unittest 9건) 실행:
 
 ```bash
 python3 -m venv .venv
