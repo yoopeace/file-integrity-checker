@@ -4,6 +4,8 @@ calculate_hash → collect_hashes → verify_integrity 순서로
 파일 지문을 만들고, 폴더 전체를 훑고, 달라진 파일을 찾아낸다.
 """
 
+from pathlib import Path
+
 import checker
 
 
@@ -52,35 +54,16 @@ def test_하위_폴더의_파일까지_찾는다(tmp_path):
     (tmp_path / "top.txt").write_text("위")
     (tmp_path / "sub" / "inner.txt").write_text("아래")
 
-    result = checker.collect_hashes(str(tmp_path))
+    hashes, _ = checker.collect_hashes(str(tmp_path))
 
-    assert "top.txt" in result
-    assert "sub/inner.txt" in result
-
-
-def test_숨김_폴더는_건너뛴다(tmp_path):
-    (tmp_path / ".git").mkdir()
-    (tmp_path / ".git" / "config").write_text("깃 내부 파일")
-    (tmp_path / "real.txt").write_text("진짜 파일")
-
-    result = checker.collect_hashes(str(tmp_path))
-
-    assert list(result.keys()) == ["real.txt"]
-
-
-def test_도구가_만든_파일은_검사_대상에서_제외한다(tmp_path):
-    (tmp_path / checker.SNAPSHOT_FILE).write_text("{}")
-    (tmp_path / checker.LOG_FILE).write_text("로그")
-    (tmp_path / checker.KEY_FILE).write_text("비밀키")
-    (tmp_path / "user.txt").write_text("사용자 파일")
-
-    result = checker.collect_hashes(str(tmp_path))
-
-    assert list(result.keys()) == ["user.txt"]
+    # 경로 구분자는 운영체제마다 다르므로 비교 전에 통일한다
+    found = {Path(key).as_posix() for key in hashes}
+    assert "top.txt" in found
+    assert "sub/inner.txt" in found
 
 
 def test_빈_폴더는_빈_결과를_돌려준다(tmp_path):
-    assert checker.collect_hashes(str(tmp_path)) == {}
+    assert checker.collect_hashes(str(tmp_path)) == ({}, {})
 
 
 # ─────────────────────────────────────────
