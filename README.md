@@ -124,7 +124,7 @@ python3 checker.py --snapshot ./검사할폴더 --exclude .git --exclude node_mo
 
 ## 테스트
 
-전체 테스트(58건 = pytest 49건 + unittest 9건) 실행:
+전체 테스트(64건 = pytest 55건 + unittest 9건) 실행:
 
 ```bash
 python3 -m venv .venv

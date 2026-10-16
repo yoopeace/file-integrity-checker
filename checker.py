@@ -19,6 +19,7 @@ import stat         # 파일 종류(일반 파일·링크·FIFO) 구분
 import sys          # 종료 코드 반환
 import argparse     # 터미널 명령줄 옵션 처리
 import logging      # 로그 파일 기록
+from dataclasses import dataclass   # 비교 결과를 담는 자료형
 from datetime import datetime  # 날짜/시간 기록
 
 # ─────────────────────────────────────────
@@ -281,13 +282,170 @@ def create_snapshot(directory: str, exclude_dirs=()) -> int:
 # ─────────────────────────────────────────
 # 기능 B: 무결성 검증
 # ─────────────────────────────────────────
+# 검증은 세 단계로 나눕니다.
+#   1) load_verified_snapshot : 스냅샷을 읽고 형식·서명을 확인
+#   2) compare                : 기준선과 현재 상태를 비교 (파일을 읽지 않는 계산만)
+#   3) print_report           : 비교 결과를 화면에 출력
+# 비교를 출력과 떼어 두면, 결과를 화면 문구가 아니라 값으로 확인할 수 있습니다.
+
+@dataclass
+class Comparison:
+    """기준선과 현재 상태를 비교한 결과."""
+    modified: list       # 내용이 바뀐 파일
+    deleted: list        # 삭제된 파일
+    added: list          # 새로 생긴 파일
+    unverifiable: dict   # 읽지 못한 파일·폴더 → 실패 이유
+
+    @property
+    def change_count(self) -> int:
+        return len(self.modified) + len(self.deleted) + len(self.added)
+
+    def exit_code(self) -> int:
+        # 일부를 확인하지 못했으면, 변경이 있든 없든 결과를 확정할 수 없습니다
+        if self.unverifiable:
+            return EXIT_SCAN_INCOMPLETE
+        return EXIT_CHANGES_DETECTED if self.change_count else EXIT_OK
+
+
+def load_verified_snapshot(allow_unsigned: bool = False):
+    """
+    스냅샷을 읽고 형식과 서명을 확인합니다.
+
+    반환값: 성공하면 (스냅샷 데이터, None), 실패하면 (None, 종료 코드)
+
+    서명을 확인할 수 없으면 기본적으로 검증을 중단합니다(fail-closed).
+    검증할 수 없는데 "무결성이 확인되었다"고 말하는 것이 가장 위험하기 때문입니다.
+    """
+    # ValueError: 깨진 JSON, UTF-8 이 아닌 바이트 / OSError: 읽기 권한 없음 등
+    try:
+        with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
+            snapshot_data = json.load(f)
+    except (OSError, ValueError) as e:
+        print(f"\n❌ 스냅샷 파일({SNAPSHOT_FILE})을 읽을 수 없습니다: {safe_path(str(e))}")
+        print("   손상되었다면 --snapshot 옵션으로 다시 생성해 주세요.\n")
+        return None, EXIT_VERIFICATION_FAILED
+
+    # JSON은 유효해도 스냅샷 형식이 아니면 안내
+    recorded_excludes = (snapshot_data.get("exclude_dirs", [])
+                         if isinstance(snapshot_data, dict) else None)
+    if (not isinstance(snapshot_data, dict)
+            or not isinstance(snapshot_data.get("files"), dict)
+            or not isinstance(recorded_excludes, list)
+            or not all(isinstance(d, str) for d in recorded_excludes)):
+        print(f"\n❌ 스냅샷 파일({SNAPSHOT_FILE})의 형식이 올바르지 않습니다.")
+        print("   --snapshot 옵션으로 다시 생성해 주세요.\n")
+        return None, EXIT_VERIFICATION_FAILED
+
+    # 스냅샷 자체가 위변조되지 않았는지 서명 확인
+    signature = snapshot_data.get("signature")
+    if signature is None or not os.path.exists(KEY_FILE):
+        reason = ("서명이 없는 스냅샷입니다 (구버전에서 생성)" if signature is None
+                  else f"비밀키 파일({KEY_FILE})이 없습니다")
+        if not allow_unsigned:
+            print(f"\n🚨 검증을 중단합니다: {reason}.")
+            print("   스냅샷 자체의 위변조 여부를 확인할 수 없어 결과를 신뢰할 수 없습니다.")
+            print("   --snapshot 으로 기준선을 다시 만들거나,")
+            print("   위험을 감수하고 진행하려면 --allow-unsigned 를 명시해 주세요.\n")
+            log.error(f"  서명 검증 불가({reason}) - 검증 중단")
+            return None, EXIT_VERIFICATION_FAILED
+        print(f"\n⚠️  주의: {reason}. --allow-unsigned 지정으로 검증을 계속합니다.")
+        print("   스냅샷 자체의 위변조 여부는 확인되지 않았습니다.")
+        log.warning(f"  서명 검증 생략({reason}) - allow_unsigned")
+    else:
+        key = load_key_or_report()
+        if key is None:
+            return None, EXIT_VERIFICATION_FAILED
+        expected = compute_signature(snapshot_data, key)
+        # 서명값은 조작될 수 있는 입력이므로 문자열인지부터 확인합니다.
+        # bytes 로 비교해야 ASCII 가 아닌 글자가 섞여도 예외 없이 '불일치'로 처리됩니다.
+        valid = (isinstance(signature, str)
+                 and hmac.compare_digest(expected.encode(), signature.encode("utf-8")))
+        if not valid:
+            print(f"\n🚨 경고: 스냅샷 파일({SNAPSHOT_FILE})의 서명이 일치하지 않습니다!")
+            print("   스냅샷 자체가 위변조되었을 가능성이 있어 검증을 중단합니다.")
+            print("   신뢰할 수 있는 기준선이 필요하면 --snapshot 으로 다시 생성해 주세요.\n")
+            log.error("  스냅샷 서명 불일치 - 위변조 의심, 검증 중단")
+            return None, EXIT_VERIFICATION_FAILED
+
+    return snapshot_data, None
+
+
+def compare(old_hashes: dict, current_hashes: dict, scan_errors: dict) -> Comparison:
+    """
+    기준선(old)과 현재(current) 해시를 비교합니다.
+    파일을 읽지 않고 사전만 다루므로, 테스트에서 값으로 바로 확인할 수 있습니다.
+    """
+    modified = []
+    deleted = []
+    for filepath, old_hash in old_hashes.items():
+        # 읽지 못한 파일(또는 읽지 못한 폴더 안의 파일)은 '삭제'가 아니라 '검사 실패'입니다.
+        # 둘을 섞으면 멀쩡히 있는 파일을 삭제됐다고 보고하게 됩니다.
+        if is_unverifiable(filepath, scan_errors):
+            continue
+        if filepath not in current_hashes:
+            deleted.append(filepath)
+        elif current_hashes[filepath] != old_hash:
+            modified.append(filepath)
+
+    added = [filepath for filepath in current_hashes if filepath not in old_hashes]
+    return Comparison(modified, deleted, added, dict(scan_errors))
+
+
+def print_report(result: Comparison, created_at: str, scanned_count: int) -> None:
+    """비교 결과를 보고서 형식으로 화면에 출력합니다."""
+    print("\n" + "="*50)
+    print("    📋 무결성 검사 결과 보고서")
+    print("="*50)
+    print(f"  스냅샷 기준 시각: {created_at}")
+    print(f"  검사 완료 시각:   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  검사 파일 수:     {scanned_count}개")
+    print("-"*50)
+
+    if result.modified:
+        print(f"\n⚠️  변조된 파일 ({len(result.modified)}개):")
+        for f in result.modified:
+            print(f"   • {safe_path(f)}")
+    else:
+        print("\n✅ 변조된 파일: 없음")
+
+    if result.deleted:
+        print(f"\n🗑️  삭제된 파일 ({len(result.deleted)}개):")
+        for f in result.deleted:
+            print(f"   • {safe_path(f)}")
+    else:
+        print("✅ 삭제된 파일: 없음")
+
+    if result.added:
+        print(f"\n📄 새로 추가된 파일 ({len(result.added)}개):")
+        for f in result.added:
+            print(f"   • {safe_path(f)}")
+    else:
+        print("✅ 새로 추가된 파일: 없음")
+
+    if result.unverifiable:
+        print(f"\n❓ 검사하지 못한 파일·폴더 ({len(result.unverifiable)}개):")
+        for f, reason in result.unverifiable.items():
+            print(f"   • {safe_path(f)} → {safe_path(reason)}")
+
+    print("="*50)
+
+    total = result.change_count
+    if result.unverifiable:
+        # 일부를 확인하지 못했으므로 '이상 없음'이라고 단언할 수 없습니다
+        print(f"\n⚠️  검사하지 못한 파일·폴더가 {len(result.unverifiable)}개 있어 결과를 확정할 수 없습니다.")
+        if total:
+            print(f"   확인된 변경은 {total}건입니다.")
+        print()
+    elif total == 0:
+        print("\n🎉 모든 파일의 무결성이 확인되었습니다!\n")
+    else:
+        print(f"\n🚨 총 {total}건의 변경이 감지되었습니다. 로그를 확인하세요.\n")
+
+
 def verify_integrity(directory: str, exclude_dirs=None, allow_unsigned: bool = False) -> int:
     """
     현재 상태와 스냅샷을 비교해 변조/추가/삭제된 파일을 탐지합니다.
     이것이 디지털 포렌식의 핵심 개념입니다!
-
-    서명을 확인할 수 없으면 기본적으로 검증을 중단합니다(fail-closed).
-    검증할 수 없는데 "무결성이 확인되었다"고 말하는 것이 가장 위험하기 때문입니다.
 
     exclude_dirs 를 생략하면 스냅샷에 기록된 제외 설정을 그대로 씁니다.
     다른 값을 주면 거부합니다.
@@ -303,59 +461,13 @@ def verify_integrity(directory: str, exclude_dirs=None, allow_unsigned: bool = F
         print("   경로를 다시 확인해 주세요.\n")
         return EXIT_USAGE_ERROR
 
-    # 저장된 스냅샷 불러오기
-    # ValueError: 깨진 JSON, UTF-8 이 아닌 바이트 / OSError: 읽기 권한 없음 등
-    try:
-        with open(SNAPSHOT_FILE, "r", encoding="utf-8") as f:
-            snapshot_data = json.load(f)
-    except (OSError, ValueError) as e:
-        print(f"\n❌ 스냅샷 파일({SNAPSHOT_FILE})을 읽을 수 없습니다: {safe_path(str(e))}")
-        print("   손상되었다면 --snapshot 옵션으로 다시 생성해 주세요.\n")
-        return EXIT_VERIFICATION_FAILED
-
-    # JSON은 유효해도 스냅샷 형식이 아니면 안내
-    recorded_excludes = (snapshot_data.get("exclude_dirs", [])
-                         if isinstance(snapshot_data, dict) else None)
-    if (not isinstance(snapshot_data, dict)
-            or not isinstance(snapshot_data.get("files"), dict)
-            or not isinstance(recorded_excludes, list)
-            or not all(isinstance(d, str) for d in recorded_excludes)):
-        print(f"\n❌ 스냅샷 파일({SNAPSHOT_FILE})의 형식이 올바르지 않습니다.")
-        print("   --snapshot 옵션으로 다시 생성해 주세요.\n")
-        return EXIT_VERIFICATION_FAILED
-
-    # 스냅샷 자체가 위변조되지 않았는지 서명 확인
-    signature = snapshot_data.get("signature")
-    if signature is None or not os.path.exists(KEY_FILE):
-        reason = ("서명이 없는 스냅샷입니다 (구버전에서 생성)" if signature is None
-                  else f"비밀키 파일({KEY_FILE})이 없습니다")
-        if not allow_unsigned:
-            print(f"\n🚨 검증을 중단합니다: {reason}.")
-            print("   스냅샷 자체의 위변조 여부를 확인할 수 없어 결과를 신뢰할 수 없습니다.")
-            print("   --snapshot 으로 기준선을 다시 만들거나,")
-            print("   위험을 감수하고 진행하려면 --allow-unsigned 를 명시해 주세요.\n")
-            log.error(f"  서명 검증 불가({reason}) - 검증 중단")
-            return EXIT_VERIFICATION_FAILED
-        print(f"\n⚠️  주의: {reason}. --allow-unsigned 지정으로 검증을 계속합니다.")
-        print("   스냅샷 자체의 위변조 여부는 확인되지 않았습니다.")
-        log.warning(f"  서명 검증 생략({reason}) - allow_unsigned")
-    else:
-        key = load_key_or_report()
-        if key is None:
-            return EXIT_VERIFICATION_FAILED
-        expected = compute_signature(snapshot_data, key)
-        # 서명값은 조작될 수 있는 입력이므로 문자열인지부터 확인합니다.
-        # bytes 로 비교해야 ASCII 가 아닌 글자가 섞여도 예외 없이 '불일치'로 처리됩니다.
-        valid = (isinstance(signature, str)
-                 and hmac.compare_digest(expected.encode(), signature.encode("utf-8")))
-        if not valid:
-            print(f"\n🚨 경고: 스냅샷 파일({SNAPSHOT_FILE})의 서명이 일치하지 않습니다!")
-            print("   스냅샷 자체가 위변조되었을 가능성이 있어 검증을 중단합니다.")
-            print("   신뢰할 수 있는 기준선이 필요하면 --snapshot 으로 다시 생성해 주세요.\n")
-            log.error("  스냅샷 서명 불일치 - 위변조 의심, 검증 중단")
-            return EXIT_VERIFICATION_FAILED
+    # 1) 스냅샷 읽기·서명 확인
+    snapshot_data, error_code = load_verified_snapshot(allow_unsigned)
+    if error_code is not None:
+        return error_code
 
     # 제외 설정은 스냅샷(서명으로 보호됨)에 기록된 것을 기준으로 합니다
+    recorded_excludes = snapshot_data.get("exclude_dirs", [])
     if exclude_dirs is not None and set(exclude_dirs) != set(recorded_excludes):
         def describe(dirs):
             return ", ".join(safe_path(d) for d in sorted(dirs)) or "없음"
@@ -364,11 +476,9 @@ def verify_integrity(directory: str, exclude_dirs=None, allow_unsigned: bool = F
         print("   --exclude 를 생략하면 스냅샷에 기록된 설정을 그대로 사용합니다.\n")
         log.error("  제외 설정 불일치 - 검증 중단")
         return EXIT_USAGE_ERROR
-    exclude_dirs = set(recorded_excludes)
 
     log.info(f"=== 무결성 검증 시작: {directory} ===")
 
-    old_hashes = snapshot_data["files"]
     # 스냅샷에서 읽은 값은 화면에 찍기 전에 정제합니다 (--allow-unsigned 면 조작됐을 수 있음)
     created_at = safe_path(str(snapshot_data.get("created_at", "알 수 없음")))
 
@@ -379,91 +489,24 @@ def verify_integrity(directory: str, exclude_dirs=None, allow_unsigned: bool = F
         print(f"   현재 검증 대상('{safe_path(os.path.abspath(directory))}')과 다릅니다. 결과 해석에 유의하세요.")
         log.warning(f"  대상 폴더 불일치 - 스냅샷: {baseline_dir} / 검증: {os.path.abspath(directory)}")
 
-    # 현재 상태의 해시 계산
-    current_hashes, scan_errors = collect_hashes(directory, exclude_dirs)
+    # 2) 현재 상태를 읽어 비교
+    current_hashes, scan_errors = collect_hashes(directory, set(recorded_excludes))
+    result = compare(snapshot_data["files"], current_hashes, scan_errors)
 
-    # ── 비교 시작 ──────────────────────────
-    modified = []   # 내용이 바뀐 파일
-    deleted  = []   # 삭제된 파일
-    added    = []   # 새로 생긴 파일
+    for f in result.deleted:
+        log.warning(f"  [삭제] {safe_path(f)}")
+    for f in result.modified:
+        log.warning(f"  [변조] {safe_path(f)}")
+    for f in result.added:
+        log.info(f"  [추가] {safe_path(f)}")
 
-    # 기존 파일 검사
-    for filepath, old_hash in old_hashes.items():
-        # 읽지 못한 파일(또는 읽지 못한 폴더 안의 파일)은 '삭제'가 아니라 '검사 실패'입니다.
-        # 둘을 섞으면 멀쩡히 있는 파일을 삭제됐다고 보고하게 됩니다.
-        if is_unverifiable(filepath, scan_errors):
-            continue
-        if filepath not in current_hashes:
-            deleted.append(filepath)
-            log.warning(f"  [삭제] {safe_path(filepath)}")
-        elif current_hashes[filepath] != old_hash:
-            modified.append(filepath)
-            log.warning(f"  [변조] {safe_path(filepath)}")
-
-    # 새로 생긴 파일 검사
-    for filepath in current_hashes:
-        if filepath not in old_hashes:
-            added.append(filepath)
-            log.info(f"  [추가] {safe_path(filepath)}")
-
-    # ── 보고서 출력 ──────────────────────
-    print("\n" + "="*50)
-    print("    📋 무결성 검사 결과 보고서")
-    print("="*50)
-    print(f"  스냅샷 기준 시각: {created_at}")
-    print(f"  검사 완료 시각:   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  검사 파일 수:     {len(current_hashes)}개")
-    print("-"*50)
-
-    if modified:
-        print(f"\n⚠️  변조된 파일 ({len(modified)}개):")
-        for f in modified:
-            print(f"   • {safe_path(f)}")
-    else:
-        print("\n✅ 변조된 파일: 없음")
-
-    if deleted:
-        print(f"\n🗑️  삭제된 파일 ({len(deleted)}개):")
-        for f in deleted:
-            print(f"   • {safe_path(f)}")
-    else:
-        print("✅ 삭제된 파일: 없음")
-
-    if added:
-        print(f"\n📄 새로 추가된 파일 ({len(added)}개):")
-        for f in added:
-            print(f"   • {safe_path(f)}")
-    else:
-        print("✅ 새로 추가된 파일: 없음")
-
-    if scan_errors:
-        print(f"\n❓ 검사하지 못한 파일·폴더 ({len(scan_errors)}개):")
-        for f, reason in scan_errors.items():
-            print(f"   • {safe_path(f)} → {safe_path(reason)}")
-
-    print("="*50)
-
-    total = len(modified) + len(deleted) + len(added)
-
-    if scan_errors:
-        # 일부를 확인하지 못했으므로 '이상 없음'이라고 단언할 수 없습니다
-        print(f"\n⚠️  검사하지 못한 파일·폴더가 {len(scan_errors)}개 있어 결과를 확정할 수 없습니다.")
-        if total:
-            print(f"   확인된 변경은 {total}건입니다.")
-        print()
-    elif total == 0:
-        print("\n🎉 모든 파일의 무결성이 확인되었습니다!\n")
-    else:
-        print(f"\n🚨 총 {total}건의 변경이 감지되었습니다. 로그를 확인하세요.\n")
-
+    # 3) 보고서 출력
+    print_report(result, created_at, len(current_hashes))
     log.info(
-        f"=== 검증 완료: 변조 {len(modified)}건, 삭제 {len(deleted)}건, "
-        f"추가 {len(added)}건, 검사실패 {len(scan_errors)}건 ==="
+        f"=== 검증 완료: 변조 {len(result.modified)}건, 삭제 {len(result.deleted)}건, "
+        f"추가 {len(result.added)}건, 검사실패 {len(result.unverifiable)}건 ==="
     )
-
-    if scan_errors:
-        return EXIT_SCAN_INCOMPLETE
-    return EXIT_CHANGES_DETECTED if total else EXIT_OK
+    return result.exit_code()
 
 
 # ─────────────────────────────────────────

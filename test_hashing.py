@@ -4,6 +4,7 @@ calculate_hash → collect_hashes → verify_integrity 순서로
 파일 지문을 만들고, 폴더 전체를 훑고, 달라진 파일을 찾아낸다.
 """
 
+import os
 from pathlib import Path
 
 import checker
@@ -119,3 +120,50 @@ def test_없던_파일이_생기면_추가로_잡아낸다(tmp_path, monkeypatch
     output = capsys.readouterr().out
     assert "새로 추가된 파일 (1개)" in output
     assert "backdoor.txt" in output
+
+
+# ─────────────────────────────────────────
+# 4. compare: 비교 로직만 따로 (파일 없이 사전만으로)
+# ─────────────────────────────────────────
+
+def test_변조_삭제_추가를_구분한다():
+    old = {"a.txt": "h1", "b.txt": "h2", "c.txt": "h3"}
+    new = {"a.txt": "h1", "b.txt": "바뀜", "d.txt": "h4"}
+
+    result = checker.compare(old, new, scan_errors={})
+
+    assert result.modified == ["b.txt"]
+    assert result.deleted == ["c.txt"]
+    assert result.added == ["d.txt"]
+    assert result.change_count == 3
+
+
+def test_바뀐_것이_없으면_변경_0건():
+    same = {"a.txt": "h1"}
+    result = checker.compare(same, dict(same), scan_errors={})
+    assert result.change_count == 0
+    assert result.exit_code() == checker.EXIT_OK
+
+
+def test_읽지_못한_파일은_삭제로_세지_않는다():
+    result = checker.compare({"a.txt": "h1"}, {}, scan_errors={"a.txt": "Permission denied"})
+    assert result.deleted == []
+    assert result.unverifiable == {"a.txt": "Permission denied"}
+
+
+def test_읽지_못한_폴더_안의_파일도_삭제로_세지_않는다():
+    old = {os.path.join("sub", "c.txt"): "h1", "a.txt": "h2"}
+    result = checker.compare(old, {"a.txt": "h2"}, scan_errors={"sub": "Permission denied"})
+    assert result.deleted == []
+
+
+def test_검사하지_못한_항목이_있으면_변경이_있어도_종료코드_4():
+    result = checker.compare({"a.txt": "h1", "b.txt": "h2"}, {"a.txt": "바뀜"},
+                             scan_errors={"b.txt": "Permission denied"})
+    assert result.modified == ["a.txt"]
+    assert result.exit_code() == checker.EXIT_SCAN_INCOMPLETE
+
+
+def test_변경이_있으면_종료코드_1():
+    result = checker.compare({"a.txt": "h1"}, {"a.txt": "바뀜"}, scan_errors={})
+    assert result.exit_code() == checker.EXIT_CHANGES_DETECTED
