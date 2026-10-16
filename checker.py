@@ -27,7 +27,7 @@ from datetime import datetime  # 날짜/시간 기록
 # ─────────────────────────────────────────
 SNAPSHOT_FILE = "snapshot.json"       # 해시 저장 파일 이름
 LOG_FILE      = "integrity_log.txt"   # 로그 파일 이름
-KEY_FILE      = ".integrity_key"      # 스냅샷 서명용 비밀키 파일 (유출 주의)
+KEY_FILE      = ".integrity_key"      # 서명용 비밀키 기본 위치 (--key-file 로 바꿀 수 있음, 유출 주의)
 
 # ─────────────────────────────────────────
 # 종료 코드 (자동화 도구가 결과를 판단할 수 있게 구분합니다)
@@ -109,7 +109,7 @@ def fingerprint(filepath: str) -> str:
 # ─────────────────────────────────────────
 # 핵심 함수 2: 폴더 내 모든 파일 해시 수집
 # ─────────────────────────────────────────
-def collect_hashes(directory: str, exclude_dirs=()) -> tuple:
+def collect_hashes(directory: str, exclude_dirs=(), key_file: str = KEY_FILE) -> tuple:
     """
     지정한 폴더 안의 모든 파일에 대해 해시를 계산합니다.
 
@@ -126,7 +126,7 @@ def collect_hashes(directory: str, exclude_dirs=()) -> tuple:
 
     # 도구가 실제로 만든 파일만 경로로 판단해 제외합니다.
     # 이름만 보고 제외하면 사용자의 backup/snapshot.json 까지 검사에서 빠집니다.
-    tool_files = (SNAPSHOT_FILE, SNAPSHOT_FILE + ".tmp", LOG_FILE, KEY_FILE)
+    tool_files = (SNAPSHOT_FILE, SNAPSHOT_FILE + ".tmp", LOG_FILE, key_file)
     tool_paths = {os.path.realpath(p) for p in tool_files}
 
     def record_unreadable_dir(error: OSError) -> None:
@@ -170,40 +170,42 @@ def is_unverifiable(path: str, errors: dict) -> bool:
 # ─────────────────────────────────────────
 # 핵심 함수 3: 스냅샷 서명 (위변조 방지)
 # ─────────────────────────────────────────
-def load_or_create_key() -> str:
+def load_or_create_key(key_file: str = KEY_FILE) -> str:
     """
     스냅샷 서명용 비밀키를 불러오거나, 없으면 새로 만듭니다.
 
     공격자가 파일을 바꾼 뒤 snapshot.json까지 함께 조작하면
     해시 비교만으로는 탐지할 수 없습니다.
     비밀키로 스냅샷에 서명해 두면 스냅샷 자체의 위변조를 잡아낼 수 있습니다.
-    (단, 키 파일이 유출되면 무력화되므로 안전한 곳에 보관해야 합니다.)
+    (단, 키 파일이 유출되면 무력화되므로 안전한 곳에 보관해야 합니다.
+     스냅샷을 수정할 수 있는 사람이 키도 읽을 수 있으면 의미가 없으므로,
+     key_file 로 USB 등 검사 대상과 다른 곳을 지정하는 것이 좋습니다.)
     """
-    if os.path.exists(KEY_FILE):
-        with open(KEY_FILE, "r", encoding="utf-8") as f:
+    if os.path.exists(key_file):
+        with open(key_file, "r", encoding="utf-8") as f:
             key = f.read().strip()
         # 빈 키로 서명하면 누구나 같은 서명을 만들 수 있습니다
         if not key:
-            raise ValueError(f"비밀키 파일({KEY_FILE})이 비어 있습니다")
+            raise ValueError(f"비밀키 파일({safe_path(key_file)})이 비어 있습니다")
         return key
 
     key = secrets.token_hex(32)   # 256비트 무작위 키
     # 처음부터 소유자 전용 권한(600)으로 만듭니다. 일반 권한으로 만든 뒤 바꾸면
     # 그 사이 잠깐 같은 컴퓨터의 다른 사용자가 키를 읽을 수 있습니다.
-    fd = os.open(KEY_FILE, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd = os.open(key_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(key)
-    log.info(f"  서명용 비밀키 생성: {KEY_FILE}")
+    log.info(f"  서명용 비밀키 생성: {key_file}")
     return key
 
 
-def load_key_or_report() -> str | None:
+def load_key_or_report(key_file: str = KEY_FILE) -> str | None:
     """키를 불러오고, 실패하면 이유를 보여준 뒤 None 을 돌려줍니다."""
     try:
-        return load_or_create_key()
+        return load_or_create_key(key_file)
     except (OSError, ValueError) as e:
         print(f"\n❌ 비밀키를 사용할 수 없습니다: {e}")
-        print(f"   {KEY_FILE} 를 확인해 주세요.\n")
+        print(f"   {safe_path(key_file)} 를 확인해 주세요.\n")
         log.error(f"  비밀키 사용 불가: {e}")
         return None
 
@@ -221,7 +223,7 @@ def compute_signature(snapshot_data: dict, key: str) -> str:
 # ─────────────────────────────────────────
 # 기능 A: 스냅샷 저장
 # ─────────────────────────────────────────
-def create_snapshot(directory: str, exclude_dirs=()) -> int:
+def create_snapshot(directory: str, exclude_dirs=(), key_file: str = KEY_FILE) -> int:
     """
     현재 상태(해시 딕셔너리)를 snapshot.json에 저장합니다.
     이것이 나중에 비교할 '기준선(baseline)'이 됩니다.
@@ -232,7 +234,7 @@ def create_snapshot(directory: str, exclude_dirs=()) -> int:
         return EXIT_USAGE_ERROR
 
     log.info(f"=== 스냅샷 생성 시작: {directory} ===")
-    hashes, errors = collect_hashes(directory, exclude_dirs)
+    hashes, errors = collect_hashes(directory, exclude_dirs, key_file)
 
     # 일부를 읽지 못한 상태로 기준선을 만들면 이후 검증 결과를 신뢰할 수 없습니다
     if errors:
@@ -254,9 +256,14 @@ def create_snapshot(directory: str, exclude_dirs=()) -> int:
     }
 
     # 스냅샷 자체의 위변조를 막기 위해 비밀키로 서명
-    key = load_key_or_report()
+    key_existed = os.path.exists(key_file)
+    key = load_key_or_report(key_file)
     if key is None:
         return EXIT_VERIFICATION_FAILED
+    if not key_existed:
+        # 키를 다른 곳에 둘수록 어디에 만들어졌는지 놓치기 쉬우므로 화면에 알립니다
+        print(f"\n🔑 새 비밀키를 만들었습니다: {safe_path(key_file)}")
+        print("   이 키가 있어야 검증할 수 있습니다. 검사 대상과 다른 곳에 안전하게 보관하세요.")
     snapshot_data["signature"] = compute_signature(snapshot_data, key)
 
     # 임시 파일에 다 쓴 뒤 한 번에 바꿔치기합니다. 기존 파일에 바로 쓰다가
@@ -307,7 +314,7 @@ class Comparison:
         return EXIT_CHANGES_DETECTED if self.change_count else EXIT_OK
 
 
-def load_verified_snapshot(allow_unsigned: bool = False):
+def load_verified_snapshot(allow_unsigned: bool = False, key_file: str = KEY_FILE):
     """
     스냅샷을 읽고 형식과 서명을 확인합니다.
 
@@ -338,12 +345,14 @@ def load_verified_snapshot(allow_unsigned: bool = False):
 
     # 스냅샷 자체가 위변조되지 않았는지 서명 확인
     signature = snapshot_data.get("signature")
-    if signature is None or not os.path.exists(KEY_FILE):
+    if signature is None or not os.path.exists(key_file):
         reason = ("서명이 없는 스냅샷입니다 (구버전에서 생성)" if signature is None
-                  else f"비밀키 파일({KEY_FILE})이 없습니다")
+                  else f"비밀키 파일({safe_path(key_file)})이 없습니다")
         if not allow_unsigned:
             print(f"\n🚨 검증을 중단합니다: {reason}.")
             print("   스냅샷 자체의 위변조 여부를 확인할 수 없어 결과를 신뢰할 수 없습니다.")
+            if signature is not None:
+                print("   키를 다른 곳에 보관한다면 --key-file 로 위치를 지정해 주세요.")
             print("   --snapshot 으로 기준선을 다시 만들거나,")
             print("   위험을 감수하고 진행하려면 --allow-unsigned 를 명시해 주세요.\n")
             log.error(f"  서명 검증 불가({reason}) - 검증 중단")
@@ -352,7 +361,7 @@ def load_verified_snapshot(allow_unsigned: bool = False):
         print("   스냅샷 자체의 위변조 여부는 확인되지 않았습니다.")
         log.warning(f"  서명 검증 생략({reason}) - allow_unsigned")
     else:
-        key = load_key_or_report()
+        key = load_key_or_report(key_file)
         if key is None:
             return None, EXIT_VERIFICATION_FAILED
         expected = compute_signature(snapshot_data, key)
@@ -363,6 +372,7 @@ def load_verified_snapshot(allow_unsigned: bool = False):
         if not valid:
             print(f"\n🚨 경고: 스냅샷 파일({SNAPSHOT_FILE})의 서명이 일치하지 않습니다!")
             print("   스냅샷 자체가 위변조되었을 가능성이 있어 검증을 중단합니다.")
+            print("   (키를 여러 개 쓴다면, 스냅샷을 만들 때 쓴 키를 --key-file 로 지정했는지 확인해 주세요.)")
             print("   신뢰할 수 있는 기준선이 필요하면 --snapshot 으로 다시 생성해 주세요.\n")
             log.error("  스냅샷 서명 불일치 - 위변조 의심, 검증 중단")
             return None, EXIT_VERIFICATION_FAILED
@@ -442,7 +452,8 @@ def print_report(result: Comparison, created_at: str, scanned_count: int) -> Non
         print(f"\n🚨 총 {total}건의 변경이 감지되었습니다. 로그를 확인하세요.\n")
 
 
-def verify_integrity(directory: str, exclude_dirs=None, allow_unsigned: bool = False) -> int:
+def verify_integrity(directory: str, exclude_dirs=None, allow_unsigned: bool = False,
+                     key_file: str = KEY_FILE) -> int:
     """
     현재 상태와 스냅샷을 비교해 변조/추가/삭제된 파일을 탐지합니다.
     이것이 디지털 포렌식의 핵심 개념입니다!
@@ -462,7 +473,7 @@ def verify_integrity(directory: str, exclude_dirs=None, allow_unsigned: bool = F
         return EXIT_USAGE_ERROR
 
     # 1) 스냅샷 읽기·서명 확인
-    snapshot_data, error_code = load_verified_snapshot(allow_unsigned)
+    snapshot_data, error_code = load_verified_snapshot(allow_unsigned, key_file)
     if error_code is not None:
         return error_code
 
@@ -490,7 +501,7 @@ def verify_integrity(directory: str, exclude_dirs=None, allow_unsigned: bool = F
         log.warning(f"  대상 폴더 불일치 - 스냅샷: {baseline_dir} / 검증: {os.path.abspath(directory)}")
 
     # 2) 현재 상태를 읽어 비교
-    current_hashes, scan_errors = collect_hashes(directory, set(recorded_excludes))
+    current_hashes, scan_errors = collect_hashes(directory, set(recorded_excludes), key_file)
     result = compare(snapshot_data["files"], current_hashes, scan_errors)
 
     for f in result.deleted:
@@ -526,6 +537,9 @@ def main():
     parser.add_argument("--exclude", metavar="폴더명", action="append", default=[],
                         help="검사에서 제외할 폴더 이름 (여러 번 지정 가능, 예: --exclude .git)\n"
                              "스냅샷에 기록되며, 검증 때 생략하면 같은 설정이 적용됩니다.")
+    parser.add_argument("--key-file", metavar="경로", default=KEY_FILE,
+                        help=f"서명용 비밀키 파일 위치 (기본: {KEY_FILE})\n"
+                             "USB 등 검사 대상과 다른 곳에 두면 스냅샷을 조작한 사람도 키를 읽지 못합니다.")
     parser.add_argument("--allow-unsigned", action="store_true",
                         help="서명이나 비밀키가 없어도 검증을 진행합니다 (신뢰도가 낮아집니다).")
 
@@ -533,10 +547,10 @@ def main():
     setup_logging()
 
     if args.snapshot:
-        return create_snapshot(args.snapshot, set(args.exclude))
+        return create_snapshot(args.snapshot, set(args.exclude), args.key_file)
     if args.verify:
         return verify_integrity(args.verify, set(args.exclude) if args.exclude else None,
-                                args.allow_unsigned)
+                                args.allow_unsigned, args.key_file)
 
     parser.print_help()
     return EXIT_USAGE_ERROR

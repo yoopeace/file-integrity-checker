@@ -277,3 +277,66 @@ def test_파일별_기록은_로그_파일에_남는다(tmp_path):
     make_docs(tmp_path, {"a.txt": "내용"})
     run("--snapshot", "./docs", cwd=tmp_path)
     assert "a.txt" in (tmp_path / checker.LOG_FILE).read_text(encoding="utf-8")
+
+
+# ─────────────────────────────────────────
+# 7. --key-file: 비밀키를 스냅샷과 다른 곳에 두기
+# ─────────────────────────────────────────
+
+def test_지정한_키_파일로_만들고_검증한다(tmp_path):
+    make_docs(tmp_path, {"a.txt": "내용"})
+    (tmp_path / "usb").mkdir()
+    key = str(tmp_path / "usb" / "integrity.key")
+
+    snap = run("--snapshot", "./docs", "--key-file", key, cwd=tmp_path)
+
+    assert snap.returncode == checker.EXIT_OK
+    assert Path(key).exists()
+    assert not (tmp_path / checker.KEY_FILE).exists(), "기본 위치에도 키를 만들었다"
+    assert run("--verify", "./docs", "--key-file", key, cwd=tmp_path).returncode == checker.EXIT_OK
+
+
+def test_새_키를_만들면_위치를_알려준다(tmp_path):
+    # 키를 다른 곳에 둘수록 어디에 만들어졌는지 놓치기 쉽다
+    make_docs(tmp_path, {"a.txt": "내용"})
+    (tmp_path / "usb").mkdir()
+    key = str(tmp_path / "usb" / "integrity.key")
+
+    result = run("--snapshot", "./docs", "--key-file", key, cwd=tmp_path)
+
+    assert key in result.stdout
+
+
+def test_키_파일을_지정하지_않으면_검증을_중단한다(tmp_path):
+    # 키를 따로 보관하면 기본 위치에는 키가 없다 → 지금처럼 fail-closed
+    make_docs(tmp_path, {"a.txt": "내용"})
+    (tmp_path / "usb").mkdir()
+    run("--snapshot", "./docs", "--key-file", str(tmp_path / "usb" / "k"), cwd=tmp_path)
+
+    result = run("--verify", "./docs", cwd=tmp_path)
+
+    assert result.returncode == checker.EXIT_VERIFICATION_FAILED
+    assert "무결성이 확인되었습니다" not in result.stdout
+
+
+def test_다른_키로_검증하면_실패하고_키를_확인하라고_안내한다(tmp_path):
+    make_docs(tmp_path, {"a.txt": "내용"})
+    (tmp_path / "usb").mkdir()
+    run("--snapshot", "./docs", "--key-file", str(tmp_path / "usb" / "right.key"), cwd=tmp_path)
+    (tmp_path / "usb" / "wrong.key").write_text("f" * 64)   # 스냅샷을 만들 때와 다른 키
+
+    result = run("--verify", "./docs", "--key-file", str(tmp_path / "usb" / "wrong.key"), cwd=tmp_path)
+
+    assert result.returncode == checker.EXIT_VERIFICATION_FAILED
+    assert "--key-file" in result.stdout
+
+
+def test_키를_만들_수_없는_경로면_스냅샷을_만들지_않는다(tmp_path):
+    # USB 가 꽂혀 있지 않은 경우처럼 폴더가 없는 경로
+    make_docs(tmp_path, {"a.txt": "내용"})
+
+    result = run("--snapshot", "./docs", "--key-file", str(tmp_path / "no_usb" / "k"), cwd=tmp_path)
+
+    assert result.returncode == checker.EXIT_VERIFICATION_FAILED
+    assert not (tmp_path / checker.SNAPSHOT_FILE).exists()
+    assert "Traceback" not in result.stderr

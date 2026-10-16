@@ -437,3 +437,44 @@ def test_allow_unsigned_옵션을_주면_서명_없이도_검증한다(tmp_path,
 
     assert code == checker.EXIT_OK
     assert "무결성이 확인되었습니다" in capsys.readouterr().out
+
+
+# ─────────────────────────────────────────
+# 8. --key-file: 비밀키를 스냅샷과 다른 곳에 두기
+# ─────────────────────────────────────────
+
+def test_지정한_경로에_키를_만든다(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    key_path = vault / "integrity.key"
+
+    checker.load_or_create_key(str(key_path))
+
+    assert key_path.exists()
+    assert stat.S_IMODE(os.stat(key_path).st_mode) == 0o600
+    assert not (tmp_path / checker.KEY_FILE).exists(), "기본 위치에도 키를 만들었다"
+
+
+def test_지정한_키로_서명하고_같은_키로_검증한다(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    make_docs(tmp_path, {"a.txt": "내용"})
+    (tmp_path / "vault").mkdir()
+    key_path = str(tmp_path / "vault" / "integrity.key")
+
+    checker.create_snapshot("./docs", key_file=key_path)
+
+    data = json.loads((tmp_path / checker.SNAPSHOT_FILE).read_text())
+    assert data["signature"] == checker.compute_signature(data, checker.load_or_create_key(key_path))
+    assert checker.verify_integrity("./docs", key_file=key_path) == checker.EXIT_OK
+
+
+def test_검사_폴더_안에_둔_키_파일은_검사에서_뺀다(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    docs = make_docs(tmp_path, {"a.txt": "내용"})
+    key_path = docs / "my.key"
+    key_path.write_text("키")
+
+    hashes, _ = checker.collect_hashes(str(docs), key_file=str(key_path))
+
+    assert list(hashes.keys()) == ["a.txt"]
