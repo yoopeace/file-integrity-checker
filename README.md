@@ -124,7 +124,7 @@ python3 checker.py --snapshot ./검사할폴더 --exclude .git --exclude node_mo
 
 ## 테스트
 
-전체 테스트(64건 = pytest 55건 + unittest 9건) 실행:
+전체 테스트(63건) 실행:
 
 ```bash
 python3 -m venv .venv
@@ -132,13 +132,10 @@ python3 -m venv .venv
 .venv/bin/pytest
 ```
 
-pytest 없이 실행 (서명 관련 9건만 해당):
-
-```bash
-python3 -m unittest test_checker
-```
-
-`test_hashing.py`, `test_robustness.py`는 pytest 기능을 사용하므로 pytest로만 실행됨.
+| 파일 | 대상 |
+|------|------|
+| `test_checker.py` | `checker.py`의 함수들 (정제·해시·폴더 훑기·서명·스냅샷·비교·검증) |
+| `test_cli.py` | 프로그램 실행 동작 (종료 코드, 망가진 스냅샷·키, 특수 파일·링크, 제외 설정) |
 
 `main` 브랜치에 push하거나 PR을 올리면 GitHub Actions에서 테스트가 자동 실행됨.
 
