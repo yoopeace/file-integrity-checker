@@ -19,7 +19,7 @@ import stat         # 파일 종류(일반 파일·링크·FIFO) 구분
 import sys          # 종료 코드 반환
 import argparse     # 터미널 명령줄 옵션 처리
 import logging      # 로그 파일 기록
-from dataclasses import dataclass   # 비교 결과를 담는 자료형
+from dataclasses import dataclass, field   # 결과를 담는 자료형
 from datetime import datetime  # 날짜/시간 기록
 
 # ─────────────────────────────────────────
@@ -399,12 +399,11 @@ def load_snapshot(snapshot_path: str = SNAPSHOT_FILE, key_file: str = KEY_FILE,
 # ─────────────────────────────────────────
 # 기능 A: 스냅샷 저장
 # ─────────────────────────────────────────
-def report_key_unavailable(error, tool_files: ToolFiles) -> int:
-    """비밀키를 쓸 수 없을 때의 안내. 종료 코드를 돌려줍니다."""
+def print_key_unavailable(error, tool_files: ToolFiles) -> None:
+    """비밀키를 쓸 수 없을 때의 안내."""
     print(f"\n❌ 비밀키를 사용할 수 없습니다: {error}")
     print(f"   {safe_path(tool_files.key)} 를 확인해 주세요.\n")
     log.error(f"  비밀키 사용 불가: {error}")
-    return EXIT_VERIFICATION_FAILED
 
 
 def create_snapshot(directory: str, exclude_dirs=(), tool_files: ToolFiles | None = None) -> int:
@@ -433,7 +432,8 @@ def create_snapshot(directory: str, exclude_dirs=(), tool_files: ToolFiles | Non
     try:
         key, key_created = key_for_signing(tool_files.key)
     except KeyUnavailable as e:
-        return report_key_unavailable(e, tool_files)
+        print_key_unavailable(e, tool_files)
+        return EXIT_VERIFICATION_FAILED
     if key_created:
         # 키를 다른 곳에 둘수록 어디에 만들어졌는지 놓치기 쉬우므로 화면에 알립니다
         print(f"\n🔑 새 비밀키를 만들었습니다: {safe_path(tool_files.key)}")
@@ -455,11 +455,11 @@ def create_snapshot(directory: str, exclude_dirs=(), tool_files: ToolFiles | Non
 # ─────────────────────────────────────────
 # 기능 B: 무결성 검증
 # ─────────────────────────────────────────
-# 검증은 세 단계로 나눕니다.
-#   1) load_snapshot : 스냅샷을 읽고 형식·서명을 확인 (스냅샷 저장소)
-#   2) compare       : 기준선과 현재 상태를 비교 (파일을 읽지 않는 계산만)
-#   3) print_report  : 비교 결과를 화면에 출력
-# 비교를 출력과 떼어 두면, 결과를 화면 문구가 아니라 값으로 확인할 수 있습니다.
+# 검증은 판단과 출력을 나눕니다.
+#   run_verification     : 스냅샷 확인 → 거부할지·주의할지 판단 → 비교. 결과를 값(VerifyOutcome)으로
+#   print_verify_outcome : 그 값을 화면에 그림
+#   verify_integrity     : 둘을 차례로 부르고 종료 코드를 돌려줌 (CLI 용)
+# 판단을 출력과 떼어 두면, 결과를 화면 문구가 아니라 값으로 확인할 수 있습니다.
 
 @dataclass
 class Comparison:
@@ -478,6 +478,46 @@ class Comparison:
         if self.unverifiable:
             return EXIT_SCAN_INCOMPLETE
         return EXIT_CHANGES_DETECTED if self.change_count else EXIT_OK
+
+
+@dataclass(frozen=True)
+class Caution:
+    """검증은 계속하지만, 결과를 해석할 때 주의할 점."""
+    kind: str          # "unverified"      : 서명 확인을 건너뜀       (detail: (이유,))
+                       # "target_mismatch" : 스냅샷과 다른 폴더를 검증 (detail: (스냅샷 기준 폴더, 지금 검사한 폴더))
+    detail: tuple = ()
+
+
+@dataclass(frozen=True)
+class Refusal:
+    """검증을 하지 않은 이유."""
+    kind: str          # "snapshot_rejected" : 스냅샷을 믿을 수 없음   (detail: SnapshotRejected)
+                       # "target_missing"    : 검사 폴더가 없음         (detail: 입력한 폴더 경로)
+                       # "exclude_mismatch"  : 제외 설정이 스냅샷과 다름 (detail: (스냅샷의 제외, 요청한 제외))
+    detail: object = None
+
+    @property
+    def exit_code(self) -> int:
+        # 스냅샷이 아예 없거나 입력이 잘못된 경우는 사용법 오류, 스냅샷을 믿을 수 없으면 검증 실패
+        if self.kind == "snapshot_rejected" and self.detail.reason != "missing":
+            return EXIT_VERIFICATION_FAILED
+        return EXIT_USAGE_ERROR
+
+
+@dataclass
+class VerifyOutcome:
+    """검증 한 번의 결과. 판단(run_verification)과 출력(print_verify_outcome)을 잇습니다."""
+    cautions: list = field(default_factory=list)   # 발생한 순서대로
+    refusal: Refusal | None = None
+    comparison: Comparison | None = None            # 거부되지 않았을 때만 있음
+    created_at: str = "알 수 없음"                   # 스냅샷 만든 시각 (조작됐을 수 있어 출력 전 정제)
+    scanned_count: int = 0
+
+    @property
+    def exit_code(self) -> int:
+        if self.refusal:
+            return self.refusal.exit_code
+        return self.comparison.exit_code()
 
 
 def compare(old_hashes: dict, current_hashes: dict, scan_errors: dict) -> Comparison:
@@ -552,21 +592,18 @@ def print_report(result: Comparison, created_at: str, scanned_count: int) -> Non
         print(f"\n🚨 총 {total}건의 변경이 감지되었습니다. 로그를 확인하세요.\n")
 
 
-def report_rejection(error: SnapshotRejected, tool_files: ToolFiles) -> int:
-    """스냅샷 저장소가 거부한 이유를 안내 문구와 종료 코드로 바꿉니다."""
+def print_rejection(error: SnapshotRejected, tool_files: ToolFiles) -> None:
+    """스냅샷 저장소가 거부한 이유를 안내 문구로 출력합니다."""
     if error.reason == "missing":
         print(f"\n❌ 스냅샷 파일({safe_path(tool_files.snapshot)})이 없습니다.")
         print("   먼저 --snapshot 옵션으로 기준선을 만들어 주세요.\n")
-        return EXIT_USAGE_ERROR
-    if error.reason == "unreadable":
+    elif error.reason == "unreadable":
         print(f"\n❌ 스냅샷 파일({safe_path(tool_files.snapshot)})을 읽을 수 없습니다: {safe_path(error.detail)}")
         print("   손상되었다면 --snapshot 옵션으로 다시 생성해 주세요.\n")
-        return EXIT_VERIFICATION_FAILED
-    if error.reason == "malformed":
+    elif error.reason == "malformed":
         print(f"\n❌ 스냅샷 파일({safe_path(tool_files.snapshot)})의 형식이 올바르지 않습니다.")
         print("   --snapshot 옵션으로 다시 생성해 주세요.\n")
-        return EXIT_VERIFICATION_FAILED
-    if error.reason in ("unsigned", "key_missing"):
+    elif error.reason in ("unsigned", "key_missing"):
         reason = unverified_description(error.reason, tool_files)
         print(f"\n🚨 검증을 중단합니다: {reason}.")
         print("   스냅샷 자체의 위변조 여부를 확인할 수 없어 결과를 신뢰할 수 없습니다.")
@@ -575,16 +612,14 @@ def report_rejection(error: SnapshotRejected, tool_files: ToolFiles) -> int:
         print("   --snapshot 으로 기준선을 다시 만들거나,")
         print("   위험을 감수하고 진행하려면 --allow-unsigned 를 명시해 주세요.\n")
         log.error(f"  서명 검증 불가({reason}) - 검증 중단")
-        return EXIT_VERIFICATION_FAILED
-    if error.reason == "key_unusable":
-        return report_key_unavailable(error.detail, tool_files)
-    # signature_mismatch
-    print(f"\n🚨 경고: 스냅샷 파일({safe_path(tool_files.snapshot)})의 서명이 일치하지 않습니다!")
-    print("   스냅샷 자체가 위변조되었을 가능성이 있어 검증을 중단합니다.")
-    print("   (키를 여러 개 쓴다면, 스냅샷을 만들 때 쓴 키를 --key-file 로 지정했는지 확인해 주세요.)")
-    print("   신뢰할 수 있는 기준선이 필요하면 --snapshot 으로 다시 생성해 주세요.\n")
-    log.error("  스냅샷 서명 불일치 - 위변조 의심, 검증 중단")
-    return EXIT_VERIFICATION_FAILED
+    elif error.reason == "key_unusable":
+        print_key_unavailable(error.detail, tool_files)
+    else:  # signature_mismatch
+        print(f"\n🚨 경고: 스냅샷 파일({safe_path(tool_files.snapshot)})의 서명이 일치하지 않습니다!")
+        print("   스냅샷 자체가 위변조되었을 가능성이 있어 검증을 중단합니다.")
+        print("   (키를 여러 개 쓴다면, 스냅샷을 만들 때 쓴 키를 --key-file 로 지정했는지 확인해 주세요.)")
+        print("   신뢰할 수 있는 기준선이 필요하면 --snapshot 으로 다시 생성해 주세요.\n")
+        log.error("  스냅샷 서명 불일치 - 위변조 의심, 검증 중단")
 
 
 def unverified_description(reason: str, tool_files: ToolFiles) -> str:
@@ -594,59 +629,55 @@ def unverified_description(reason: str, tool_files: ToolFiles) -> str:
     return f"비밀키 파일({safe_path(tool_files.key)})이 없습니다"
 
 
-def verify_integrity(directory: str, exclude_dirs=None, allow_unsigned: bool = False,
-                     tool_files: ToolFiles | None = None) -> int:
+def run_verification(directory: str, exclude_dirs=None, allow_unsigned: bool = False,
+                     tool_files: ToolFiles | None = None) -> VerifyOutcome:
     """
-    현재 상태와 스냅샷을 비교해 변조/추가/삭제된 파일을 탐지합니다.
+    현재 상태와 스냅샷을 비교해 변조/추가/삭제된 파일을 찾고, 결과를 값으로 돌려줍니다.
     이것이 디지털 포렌식의 핵심 개념입니다!
+    화면에는 아무것도 출력하지 않습니다 (검사 기록 로그만 남깁니다).
 
     exclude_dirs 를 생략하면 스냅샷에 기록된 제외 설정을 그대로 씁니다.
     다른 값을 주면 거부합니다.
     """
     tool_files = tool_files or ToolFiles()
+    outcome = VerifyOutcome()
 
     # 1) 스냅샷 읽기·서명 확인
     try:
         snapshot = load_snapshot(tool_files.snapshot, tool_files.key, allow_unsigned)
     except SnapshotRejected as e:
-        return report_rejection(e, tool_files)
+        outcome.refusal = Refusal("snapshot_rejected", e)
+        return outcome
 
     if not os.path.isdir(directory):
-        print(f"\n❌ 폴더를 찾을 수 없습니다: {safe_path(directory)}")
-        print("   경로를 다시 확인해 주세요.\n")
-        return EXIT_USAGE_ERROR
+        outcome.refusal = Refusal("target_missing", directory)
+        return outcome
 
     if snapshot.unverified_reason:
+        outcome.cautions.append(Caution("unverified", (snapshot.unverified_reason,)))
         reason = unverified_description(snapshot.unverified_reason, tool_files)
-        print(f"\n⚠️  주의: {reason}. --allow-unsigned 지정으로 검증을 계속합니다.")
-        print("   스냅샷 자체의 위변조 여부는 확인되지 않았습니다.")
         log.warning(f"  서명 검증 생략({reason}) - allow_unsigned")
 
     # 제외 설정은 스냅샷(서명으로 보호됨)에 기록된 것을 기준으로 합니다
     if exclude_dirs is not None and set(exclude_dirs) != set(snapshot.exclude_dirs):
-        def describe(dirs):
-            return ", ".join(safe_path(d) for d in sorted(dirs)) or "없음"
-        print("\n❌ 제외 설정이 스냅샷과 다릅니다.")
-        print(f"   스냅샷: {describe(snapshot.exclude_dirs)} / 지금: {describe(exclude_dirs)}")
-        print("   --exclude 를 생략하면 스냅샷에 기록된 설정을 그대로 사용합니다.\n")
+        outcome.refusal = Refusal("exclude_mismatch", (snapshot.exclude_dirs, exclude_dirs))
         log.error("  제외 설정 불일치 - 검증 중단")
-        return EXIT_USAGE_ERROR
+        return outcome
 
     log.info(f"=== 무결성 검증 시작: {directory} ===")
+    outcome.created_at = snapshot.created_at or "알 수 없음"
 
-    # 스냅샷에서 읽은 값은 화면에 찍기 전에 정제합니다 (--allow-unsigned 면 조작됐을 수 있음)
-    created_at = safe_path(snapshot.created_at or "알 수 없음")
-
-    # 검증 대상 폴더가 스냅샷 생성 당시 폴더와 다르면 경고
-    baseline_dir = snapshot.target_directory
-    if baseline_dir and os.path.abspath(directory) != baseline_dir:
-        print(f"\n⚠️  주의: 스냅샷은 '{safe_path(baseline_dir)}' 폴더 기준으로 생성되었습니다.")
-        print(f"   현재 검증 대상('{safe_path(os.path.abspath(directory))}')과 다릅니다. 결과 해석에 유의하세요.")
-        log.warning(f"  대상 폴더 불일치 - 스냅샷: {baseline_dir} / 검증: {os.path.abspath(directory)}")
+    # 검증 대상 폴더가 스냅샷 생성 당시 폴더와 다르면 주의
+    current_dir = os.path.abspath(directory)
+    if snapshot.target_directory and current_dir != snapshot.target_directory:
+        outcome.cautions.append(Caution("target_mismatch", (snapshot.target_directory, current_dir)))
+        log.warning(f"  대상 폴더 불일치 - 스냅샷: {snapshot.target_directory} / 검증: {current_dir}")
 
     # 2) 현재 상태를 읽어 비교
     current_hashes, scan_errors = collect_hashes(directory, set(snapshot.exclude_dirs), tool_files)
     result = compare(snapshot.files, current_hashes, scan_errors)
+    outcome.comparison = result
+    outcome.scanned_count = len(current_hashes)
 
     for f in result.deleted:
         log.warning(f"  [삭제] {safe_path(f)}")
@@ -654,14 +685,51 @@ def verify_integrity(directory: str, exclude_dirs=None, allow_unsigned: bool = F
         log.warning(f"  [변조] {safe_path(f)}")
     for f in result.added:
         log.info(f"  [추가] {safe_path(f)}")
-
-    # 3) 보고서 출력
-    print_report(result, created_at, len(current_hashes))
     log.info(
         f"=== 검증 완료: 변조 {len(result.modified)}건, 삭제 {len(result.deleted)}건, "
         f"추가 {len(result.added)}건, 검사실패 {len(result.unverifiable)}건 ==="
     )
-    return result.exit_code()
+    return outcome
+
+
+def print_verify_outcome(outcome: VerifyOutcome, tool_files: ToolFiles) -> None:
+    """검증 결과를 화면에 그립니다. 항상 '주의 → 거부 안내 또는 보고서' 순서입니다."""
+    for caution in outcome.cautions:
+        if caution.kind == "unverified":
+            reason = unverified_description(caution.detail[0], tool_files)
+            print(f"\n⚠️  주의: {reason}. --allow-unsigned 지정으로 검증을 계속합니다.")
+            print("   스냅샷 자체의 위변조 여부는 확인되지 않았습니다.")
+        elif caution.kind == "target_mismatch":
+            baseline_dir, current_dir = caution.detail
+            print(f"\n⚠️  주의: 스냅샷은 '{safe_path(baseline_dir)}' 폴더 기준으로 생성되었습니다.")
+            print(f"   현재 검증 대상('{safe_path(current_dir)}')과 다릅니다. 결과 해석에 유의하세요.")
+
+    refusal = outcome.refusal
+    if refusal is None:
+        # 스냅샷에서 읽은 값은 화면에 찍기 전에 정제합니다 (--allow-unsigned 면 조작됐을 수 있음)
+        print_report(outcome.comparison, safe_path(outcome.created_at), outcome.scanned_count)
+    elif refusal.kind == "snapshot_rejected":
+        print_rejection(refusal.detail, tool_files)
+    elif refusal.kind == "target_missing":
+        print(f"\n❌ 폴더를 찾을 수 없습니다: {safe_path(refusal.detail)}")
+        print("   경로를 다시 확인해 주세요.\n")
+    else:  # exclude_mismatch
+        recorded, requested = refusal.detail
+
+        def describe(dirs):
+            return ", ".join(safe_path(d) for d in sorted(dirs)) or "없음"
+        print("\n❌ 제외 설정이 스냅샷과 다릅니다.")
+        print(f"   스냅샷: {describe(recorded)} / 지금: {describe(requested)}")
+        print("   --exclude 를 생략하면 스냅샷에 기록된 설정을 그대로 사용합니다.\n")
+
+
+def verify_integrity(directory: str, exclude_dirs=None, allow_unsigned: bool = False,
+                     tool_files: ToolFiles | None = None) -> int:
+    """검증하고, 결과를 화면에 출력한 뒤 종료 코드를 돌려줍니다 (CLI 용)."""
+    tool_files = tool_files or ToolFiles()
+    outcome = run_verification(directory, exclude_dirs, allow_unsigned, tool_files)
+    print_verify_outcome(outcome, tool_files)
+    return outcome.exit_code
 
 
 # ─────────────────────────────────────────

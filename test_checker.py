@@ -404,120 +404,186 @@ def test_변경이_있으면_종료코드_1():
 
 
 # ─────────────────────────────────────────
-# 7. verify_integrity: 검증과 보고서
+# 7. 검증: 판단은 결과 값으로 (run_verification)
 # ─────────────────────────────────────────
 
-def test_변경이_없으면_무결성_확인_메시지를_낸다(tmp_path, capsys):
+def snapshot_docs(tmp_path, files):
+    """docs 폴더를 만들고 스냅샷을 찍은 뒤 (docs 경로, ToolFiles)를 돌려준다."""
     tf = tool_files_in(tmp_path)
-    make_docs(tmp_path, {"doc1.txt": "원본"})
-
-    checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
-    checker.verify_integrity(str(tmp_path / "docs"), tool_files=tf)
-
-    assert "모든 파일의 무결성이 확인되었습니다" in capsys.readouterr().out
+    docs = make_docs(tmp_path, files)
+    checker.create_snapshot(str(docs), tool_files=tf)
+    return docs, tf
 
 
-def test_파일_내용이_바뀌면_변조로_잡아낸다(tmp_path, capsys):
-    tf = tool_files_in(tmp_path)
-    docs = make_docs(tmp_path, {"doc1.txt": "원본"})
+def test_변경이_없으면_변경_0건이다(tmp_path):
+    docs, tf = snapshot_docs(tmp_path, {"doc1.txt": "원본"})
 
-    checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
+    outcome = checker.run_verification(str(docs), tool_files=tf)
+
+    assert outcome.refusal is None
+    assert outcome.cautions == []
+    assert outcome.comparison.change_count == 0
+    assert outcome.exit_code == checker.EXIT_OK
+
+
+def test_파일_내용이_바뀌면_변조로_잡아낸다(tmp_path):
+    docs, tf = snapshot_docs(tmp_path, {"doc1.txt": "원본"})
     (docs / "doc1.txt").write_text("몰래 바꾼 내용")
-    checker.verify_integrity(str(tmp_path / "docs"), tool_files=tf)
 
-    output = capsys.readouterr().out
-    assert "변조된 파일 (1개)" in output
-    assert "doc1.txt" in output
+    outcome = checker.run_verification(str(docs), tool_files=tf)
+
+    assert outcome.comparison.modified == ["doc1.txt"]
+    assert outcome.exit_code == checker.EXIT_CHANGES_DETECTED
 
 
-def test_파일이_사라지면_삭제로_잡아낸다(tmp_path, capsys):
-    tf = tool_files_in(tmp_path)
-    docs = make_docs(tmp_path, {"doc1.txt": "원본"})
-
-    checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
+def test_파일이_사라지면_삭제로_잡아낸다(tmp_path):
+    docs, tf = snapshot_docs(tmp_path, {"doc1.txt": "원본"})
     (docs / "doc1.txt").unlink()
-    checker.verify_integrity(str(tmp_path / "docs"), tool_files=tf)
 
-    assert "삭제된 파일 (1개)" in capsys.readouterr().out
+    assert checker.run_verification(str(docs), tool_files=tf).comparison.deleted == ["doc1.txt"]
 
 
-def test_없던_파일이_생기면_추가로_잡아낸다(tmp_path, capsys):
-    tf = tool_files_in(tmp_path)
-    docs = make_docs(tmp_path, {"doc1.txt": "원본"})
-
-    checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
+def test_없던_파일이_생기면_추가로_잡아낸다(tmp_path):
+    docs, tf = snapshot_docs(tmp_path, {"doc1.txt": "원본"})
     (docs / "backdoor.txt").write_text("해킹 흔적")
-    checker.verify_integrity(str(tmp_path / "docs"), tool_files=tf)
 
-    output = capsys.readouterr().out
-    assert "새로 추가된 파일 (1개)" in output
-    assert "backdoor.txt" in output
+    assert checker.run_verification(str(docs), tool_files=tf).comparison.added == ["backdoor.txt"]
 
 
-def test_읽기_실패_파일이_삭제로_표시되지_않는다(tmp_path, capsys):
-    tf = tool_files_in(tmp_path)
-    docs = make_docs(tmp_path, {"ok.txt": "정상", "blocked.txt": "비밀"})
-
-    checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
+def test_읽기_실패_파일은_삭제가_아니라_검사_실패다(tmp_path):
+    docs, tf = snapshot_docs(tmp_path, {"ok.txt": "정상", "blocked.txt": "비밀"})
     (docs / "blocked.txt").chmod(0o000)
     try:
-        code = checker.verify_integrity(str(tmp_path / "docs"), tool_files=tf)
-        output = capsys.readouterr().out
-        assert "삭제된 파일 (1개)" not in output, "읽기 실패를 삭제로 오판함"
-        assert "검사하지 못한 파일" in output
-        assert code == checker.EXIT_SCAN_INCOMPLETE
+        outcome = checker.run_verification(str(docs), tool_files=tf)
+        assert outcome.comparison.deleted == [], "읽기 실패를 삭제로 오판함"
+        assert "blocked.txt" in outcome.comparison.unverifiable
+        assert outcome.exit_code == checker.EXIT_SCAN_INCOMPLETE
     finally:
         (docs / "blocked.txt").chmod(0o644)
 
 
-def test_형식이_잘못된_스냅샷은_크래시_없이_검증_실패(tmp_path):
+def test_스냅샷이_없으면_거부하고_종료코드_2(tmp_path):
     tf = tool_files_in(tmp_path)
-    make_docs(tmp_path, {"doc1.txt": "원본"})
-    (tmp_path / checker.SNAPSHOT_FILE).write_text("{}")  # 유효한 JSON 이지만 스냅샷 형식이 아님
+    docs = make_docs(tmp_path, {"a.txt": "내용"})
 
-    assert checker.verify_integrity(str(tmp_path / "docs"), tool_files=tf) == checker.EXIT_VERIFICATION_FAILED
+    outcome = checker.run_verification(str(docs), tool_files=tf)
 
-
-def test_키가_없으면_검증을_중단하고_성공을_말하지_않는다(tmp_path, capsys):
-    tf = tool_files_in(tmp_path)
-    make_docs(tmp_path, {"a.txt": "내용"})
-
-    checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
-    (tmp_path / checker.KEY_FILE).unlink()
-
-    code = checker.verify_integrity(str(tmp_path / "docs"), tool_files=tf)
-    output = capsys.readouterr().out
-
-    assert "무결성이 확인되었습니다" not in output, "검증 불가 상태에서 성공을 단언함"
-    assert code == checker.EXIT_VERIFICATION_FAILED
+    assert outcome.refusal.kind == "snapshot_rejected"
+    assert outcome.refusal.detail.reason == "missing"
+    assert outcome.exit_code == checker.EXIT_USAGE_ERROR
 
 
-def test_서명이_없는_스냅샷은_검증을_중단한다(tmp_path, capsys):
-    tf = tool_files_in(tmp_path)
-    make_docs(tmp_path, {"a.txt": "내용"})
+def test_형식이_잘못된_스냅샷은_거부하고_종료코드_3(tmp_path):
+    docs, tf = snapshot_docs(tmp_path, {"doc1.txt": "원본"})
+    Path(tf.snapshot).write_text("{}")  # 유효한 JSON 이지만 스냅샷 형식이 아님
 
-    checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
-    data = json.loads((tmp_path / checker.SNAPSHOT_FILE).read_text())
+    outcome = checker.run_verification(str(docs), tool_files=tf)
+
+    assert outcome.refusal.detail.reason == "malformed"
+    assert outcome.exit_code == checker.EXIT_VERIFICATION_FAILED
+
+
+def test_키가_없으면_거부한다(tmp_path):
+    docs, tf = snapshot_docs(tmp_path, {"a.txt": "내용"})
+    Path(tf.key).unlink()
+
+    outcome = checker.run_verification(str(docs), tool_files=tf)
+
+    assert outcome.refusal.detail.reason == "key_missing"
+    assert outcome.comparison is None, "거부했는데 비교를 했다"
+    assert outcome.exit_code == checker.EXIT_VERIFICATION_FAILED
+
+
+def test_서명이_없는_스냅샷은_거부한다(tmp_path):
+    docs, tf = snapshot_docs(tmp_path, {"a.txt": "내용"})
+    data = json.loads(Path(tf.snapshot).read_text())
     del data["signature"]
-    (tmp_path / checker.SNAPSHOT_FILE).write_text(json.dumps(data))
+    Path(tf.snapshot).write_text(json.dumps(data))
 
-    code = checker.verify_integrity(str(tmp_path / "docs"), tool_files=tf)
+    outcome = checker.run_verification(str(docs), tool_files=tf)
 
-    assert "무결성이 확인되었습니다" not in capsys.readouterr().out
+    assert outcome.refusal.detail.reason == "unsigned"
+    assert outcome.exit_code == checker.EXIT_VERIFICATION_FAILED
+
+
+def test_서명_확인을_건너뛰면_주의를_남기고_검증한다(tmp_path):
+    docs, tf = snapshot_docs(tmp_path, {"a.txt": "내용"})
+    Path(tf.key).unlink()
+
+    outcome = checker.run_verification(str(docs), allow_unsigned=True, tool_files=tf)
+
+    assert outcome.refusal is None
+    assert outcome.cautions == [checker.Caution("unverified", ("key_missing",))]
+    assert outcome.exit_code == checker.EXIT_OK
+
+
+def test_검사_폴더가_없으면_거부하고_종료코드_2(tmp_path):
+    _, tf = snapshot_docs(tmp_path, {"a.txt": "내용"})
+
+    outcome = checker.run_verification(str(tmp_path / "no_such"), tool_files=tf)
+
+    assert outcome.refusal.kind == "target_missing"
+    assert outcome.exit_code == checker.EXIT_USAGE_ERROR
+
+
+def test_제외_설정이_스냅샷과_다르면_거부하고_종료코드_2(tmp_path):
+    # 검증 때만 몰래 폴더를 빼면 그 안의 변조를 숨길 수 있다
+    docs, tf = snapshot_docs(tmp_path, {"a.txt": "내용", ".git/payload": "원본"})
+
+    outcome = checker.run_verification(str(docs), exclude_dirs={".git"}, tool_files=tf)
+
+    assert outcome.refusal.kind == "exclude_mismatch"
+    assert outcome.comparison is None
+    assert outcome.exit_code == checker.EXIT_USAGE_ERROR
+
+
+def test_다른_폴더를_검증하면_대상_폴더_불일치를_주의로_남긴다(tmp_path):
+    docs, tf = snapshot_docs(tmp_path, {"a.txt": "내용"})
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "a.txt").write_text("내용")
+
+    outcome = checker.run_verification(str(other), tool_files=tf)
+
+    assert outcome.cautions == [
+        checker.Caution("target_mismatch", (os.path.abspath(docs), os.path.abspath(other)))
+    ]
+    assert outcome.refusal is None   # 경고만 하고 검증은 계속한다
+
+
+# ─────────────────────────────────────────
+# 7-1. 검증: 안전과 직결된 화면 문구 (verify_integrity)
+# ─────────────────────────────────────────
+
+def test_변경이_없으면_무결성_확인_메시지를_낸다(tmp_path, capsys):
+    docs, tf = snapshot_docs(tmp_path, {"doc1.txt": "원본"})
+    capsys.readouterr()
+
+    checker.verify_integrity(str(docs), tool_files=tf)
+
+    assert "모든 파일의 무결성이 확인되었습니다" in capsys.readouterr().out
+
+
+def test_거부했을_때는_절대_무결성_확인을_말하지_않는다(tmp_path, capsys):
+    docs, tf = snapshot_docs(tmp_path, {"a.txt": "내용"})
+    Path(tf.key).unlink()
+    capsys.readouterr()
+
+    code = checker.verify_integrity(str(docs), tool_files=tf)
+
+    assert "무결성이 확인되었습니다" not in capsys.readouterr().out, "검증 불가 상태에서 성공을 단언함"
     assert code == checker.EXIT_VERIFICATION_FAILED
 
 
-def test_allow_unsigned_옵션을_주면_서명_없이도_검증한다(tmp_path, capsys):
-    tf = tool_files_in(tmp_path)
-    make_docs(tmp_path, {"a.txt": "내용"})
+def test_주의가_거부_안내보다_먼저_나온다(tmp_path, capsys):
+    docs, tf = snapshot_docs(tmp_path, {"a.txt": "내용"})
+    Path(tf.key).unlink()
+    capsys.readouterr()
 
-    checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
-    (tmp_path / checker.KEY_FILE).unlink()
+    checker.verify_integrity(str(docs), exclude_dirs={"cache"}, allow_unsigned=True, tool_files=tf)
 
-    code = checker.verify_integrity(str(tmp_path / "docs"), allow_unsigned=True, tool_files=tf)
-
-    assert code == checker.EXIT_OK
-    assert "무결성이 확인되었습니다" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert output.index("주의") < output.index("제외 설정이 스냅샷과 다릅니다")
 
 
 # ─────────────────────────────────────────
