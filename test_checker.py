@@ -11,6 +11,7 @@ import os
 import stat
 from pathlib import Path
 
+import pytest
 
 import checker
 
@@ -207,28 +208,88 @@ def test_signature_항목_자체는_서명_계산에서_제외한다():
             == checker.compute_signature(signed, SAMPLE_KEY))
 
 
-def test_키_파일이_없으면_만든다(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    assert not os.path.exists(checker.KEY_FILE)
+def test_서명용_키가_없으면_만들고_만들었다고_알린다(tmp_path):
+    key_path = tmp_path / "integrity.key"
 
-    key = checker.load_or_create_key()
+    key, created = checker.key_for_signing(str(key_path))
 
-    assert os.path.exists(checker.KEY_FILE)
+    assert key_path.exists()
+    assert created is True
     assert len(key) >= 32
 
 
-def test_다시_불러오면_같은_키를_돌려준다(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    assert checker.load_or_create_key() == checker.load_or_create_key()
+def test_서명용_키가_있으면_그대로_쓰고_새로_만들지_않는다(tmp_path):
+    key_path = str(tmp_path / "integrity.key")
+    first, _ = checker.key_for_signing(key_path)
+
+    second, created = checker.key_for_signing(key_path)
+
+    assert second == first
+    assert created is False
 
 
-def test_키_파일은_소유자만_읽을_수_있다(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    checker.load_or_create_key()
+def test_키_파일은_소유자만_읽을_수_있다(tmp_path):
+    key_path = tmp_path / "integrity.key"
+    checker.key_for_signing(str(key_path))
 
-    mode = stat.S_IMODE(os.stat(checker.KEY_FILE).st_mode)
+    mode = stat.S_IMODE(os.stat(key_path).st_mode)
 
     assert mode == 0o600, f"키 파일 권한이 {oct(mode)} 이라 다른 사용자가 읽을 수 있다"
+
+
+def test_빈_키_파일로는_서명하지_않는다(tmp_path):
+    # 빈 키로 서명하면 누구나 같은 서명을 만들 수 있다
+    key_path = tmp_path / "integrity.key"
+    key_path.write_text("")
+
+    with pytest.raises(checker.KeyUnavailable):
+        checker.key_for_signing(str(key_path))
+
+
+def test_키를_만들_수_없는_경로면_서명하지_않는다(tmp_path):
+    # USB 가 꽂혀 있지 않은 경우처럼 폴더가 없는 경로
+    with pytest.raises(checker.KeyUnavailable):
+        checker.key_for_signing(str(tmp_path / "no_usb" / "integrity.key"))
+
+
+def test_검증용_키는_서명용으로_만든_키와_같다(tmp_path):
+    key_path = str(tmp_path / "integrity.key")
+    key, _ = checker.key_for_signing(key_path)
+
+    assert checker.key_for_verifying(key_path) == key
+
+
+def test_검증용_키가_없으면_만들지_않고_없다고_알린다(tmp_path):
+    # 검증 쪽이 키를 새로 만들면, 엉뚱한 새 키로 서명을 확인하게 된다
+    key_path = tmp_path / "integrity.key"
+
+    with pytest.raises(checker.KeyUnavailable) as exc:
+        checker.key_for_verifying(str(key_path))
+
+    assert exc.value.missing is True
+    assert not key_path.exists(), "검증 쪽이 키를 새로 만들었다"
+
+
+def test_빈_검증용_키는_쓸_수_없다(tmp_path):
+    key_path = tmp_path / "integrity.key"
+    key_path.write_text("")
+
+    with pytest.raises(checker.KeyUnavailable) as exc:
+        checker.key_for_verifying(str(key_path))
+
+    assert exc.value.missing is False
+
+
+def test_읽을_수_없는_검증용_키는_쓸_수_없다(tmp_path):
+    key_path = tmp_path / "integrity.key"
+    key_path.write_text("a" * 64)
+    key_path.chmod(0o000)
+    try:
+        with pytest.raises(checker.KeyUnavailable) as exc:
+            checker.key_for_verifying(str(key_path))
+        assert exc.value.missing is False
+    finally:
+        key_path.chmod(0o600)
 
 
 # ─────────────────────────────────────────
@@ -243,7 +304,7 @@ def test_스냅샷에_서명이_들어간다(tmp_path, monkeypatch):
 
     data = json.loads((tmp_path / checker.SNAPSHOT_FILE).read_text())
     assert "signature" in data
-    assert data["signature"] == checker.compute_signature(data, checker.load_or_create_key())
+    assert data["signature"] == checker.compute_signature(data, checker.key_for_verifying(checker.KEY_FILE))
 
 
 def test_읽기_실패가_있으면_스냅샷을_만들지_않는다(tmp_path, monkeypatch):
@@ -257,6 +318,17 @@ def test_읽기_실패가_있으면_스냅샷을_만들지_않는다(tmp_path, m
             "불완전한 스캔으로 기준선을 만들면 이후 검증을 신뢰할 수 없다"
     finally:
         (docs / "blocked.txt").chmod(0o644)
+
+
+def test_빈_키_파일로는_스냅샷을_만들지_않는다(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    make_docs(tmp_path, {"a.txt": "내용"})
+    (tmp_path / checker.KEY_FILE).write_text("")
+
+    code = checker.create_snapshot("./docs")
+
+    assert code == checker.EXIT_VERIFICATION_FAILED
+    assert not (tmp_path / checker.SNAPSHOT_FILE).exists()
 
 
 def test_스냅샷_저장이_중간에_실패해도_기존_기준선은_남는다(tmp_path, monkeypatch):
@@ -449,7 +521,7 @@ def test_지정한_경로에_키를_만든다(tmp_path, monkeypatch):
     vault.mkdir()
     key_path = vault / "integrity.key"
 
-    checker.load_or_create_key(str(key_path))
+    checker.key_for_signing(str(key_path))
 
     assert key_path.exists()
     assert stat.S_IMODE(os.stat(key_path).st_mode) == 0o600
@@ -465,7 +537,7 @@ def test_지정한_키로_서명하고_같은_키로_검증한다(tmp_path, monk
     checker.create_snapshot("./docs", key_file=key_path)
 
     data = json.loads((tmp_path / checker.SNAPSHOT_FILE).read_text())
-    assert data["signature"] == checker.compute_signature(data, checker.load_or_create_key(key_path))
+    assert data["signature"] == checker.compute_signature(data, checker.key_for_verifying(str(key_path)))
     assert checker.verify_integrity("./docs", key_file=key_path) == checker.EXIT_OK
 
 
@@ -478,3 +550,172 @@ def test_검사_폴더_안에_둔_키_파일은_검사에서_뺀다(tmp_path, mo
     hashes, _ = checker.collect_hashes(str(docs), key_file=str(key_path))
 
     assert list(hashes.keys()) == ["a.txt"]
+
+
+# ─────────────────────────────────────────
+# 9. 스냅샷 저장소: 서명해서 저장하고, 검증해서 불러오기
+# ─────────────────────────────────────────
+
+def saved_snapshot(tmp_path, files=None, exclude_dirs=()):
+    """서명된 스냅샷을 저장하고 (스냅샷 경로, 키 경로)를 돌려준다."""
+    snapshot_path = str(tmp_path / checker.SNAPSHOT_FILE)
+    key_path = str(tmp_path / "integrity.key")
+    key, _ = checker.key_for_signing(key_path)
+    checker.save_snapshot(str(tmp_path / "docs"), files or {"a.txt": "h1"},
+                          exclude_dirs, key, snapshot_path)
+    return snapshot_path, key_path
+
+
+def tamper(snapshot_path, **changes):
+    """스냅샷 파일의 항목을 바꿔치기한다 (공격자 흉내)."""
+    data = json.loads(Path(snapshot_path).read_text())
+    data.update(changes)
+    Path(snapshot_path).write_text(json.dumps(data, ensure_ascii=False))
+
+
+def rejection_reason(snapshot_path, key_path, allow_unsigned=False):
+    with pytest.raises(checker.SnapshotRejected) as exc:
+        checker.load_snapshot(snapshot_path, key_path, allow_unsigned)
+    return exc.value.reason
+
+
+def test_저장한_스냅샷을_그대로_불러온다(tmp_path):
+    snapshot_path, key_path = saved_snapshot(tmp_path, {"a.txt": "h1", "b.txt": "h2"}, {"cache"})
+
+    snapshot = checker.load_snapshot(snapshot_path, key_path)
+
+    assert snapshot.files == {"a.txt": "h1", "b.txt": "h2"}
+    assert snapshot.exclude_dirs == ["cache"]
+    assert snapshot.target_directory == os.path.abspath(tmp_path / "docs")
+    assert isinstance(snapshot.created_at, str)
+    assert snapshot.unverified_reason is None, "신뢰할 수 있는 스냅샷이어야 한다"
+
+
+def test_스냅샷이_없으면_거부한다(tmp_path):
+    assert rejection_reason(str(tmp_path / "none.json"), str(tmp_path / "k")) == "missing"
+
+
+def test_읽을_권한이_없는_스냅샷은_거부한다(tmp_path):
+    snapshot_path, key_path = saved_snapshot(tmp_path)
+    Path(snapshot_path).chmod(0o000)
+    try:
+        assert rejection_reason(snapshot_path, key_path) == "unreadable"
+    finally:
+        Path(snapshot_path).chmod(0o644)
+
+
+def test_UTF8이_아닌_스냅샷은_거부한다(tmp_path):
+    snapshot_path, key_path = saved_snapshot(tmp_path)
+    Path(snapshot_path).write_bytes(b"\xff\xfe garbage")
+    assert rejection_reason(snapshot_path, key_path) == "unreadable"
+
+
+def test_깨진_JSON_스냅샷은_거부한다(tmp_path):
+    snapshot_path, key_path = saved_snapshot(tmp_path)
+    Path(snapshot_path).write_text("{oops")
+    assert rejection_reason(snapshot_path, key_path) == "unreadable"
+
+
+def test_스냅샷_형식이_아닌_JSON은_거부한다(tmp_path):
+    snapshot_path, key_path = saved_snapshot(tmp_path)
+    Path(snapshot_path).write_text("{}")
+    assert rejection_reason(snapshot_path, key_path) == "malformed"
+
+
+def test_파일_해시_값이_문자열이_아니면_형식_오류로_거부한다(tmp_path):
+    snapshot_path, key_path = saved_snapshot(tmp_path)
+    tamper(snapshot_path, files={"a.txt": 123})
+    assert rejection_reason(snapshot_path, key_path) == "malformed"
+
+
+def test_내용을_바꿔치기하면_서명_불일치로_거부한다(tmp_path):
+    snapshot_path, key_path = saved_snapshot(tmp_path)
+    tamper(snapshot_path, files={"a.txt": "공격자가_맞춘_해시"})
+    assert rejection_reason(snapshot_path, key_path) == "signature_mismatch"
+
+
+def test_서명값이_문자열이_아니면_서명_불일치로_거부한다(tmp_path):
+    snapshot_path, key_path = saved_snapshot(tmp_path)
+    tamper(snapshot_path, signature=123)
+    assert rejection_reason(snapshot_path, key_path) == "signature_mismatch"
+
+
+def test_서명값에_ASCII가_아닌_글자가_있어도_서명_불일치로_거부한다(tmp_path):
+    snapshot_path, key_path = saved_snapshot(tmp_path)
+    tamper(snapshot_path, signature="é")
+    assert rejection_reason(snapshot_path, key_path) == "signature_mismatch"
+
+
+def test_서명이_없는_스냅샷은_거부한다(tmp_path):
+    snapshot_path, key_path = saved_snapshot(tmp_path)
+    data = json.loads(Path(snapshot_path).read_text())
+    del data["signature"]
+    Path(snapshot_path).write_text(json.dumps(data))
+    assert rejection_reason(snapshot_path, key_path) == "unsigned"
+
+
+def test_키가_없으면_거부하고_키를_만들지_않는다(tmp_path):
+    snapshot_path, key_path = saved_snapshot(tmp_path)
+    os.remove(key_path)
+
+    assert rejection_reason(snapshot_path, key_path) == "key_missing"
+    assert not os.path.exists(key_path), "검증 쪽이 키를 새로 만들었다"
+
+
+def test_빈_키로는_검증하지_않는다(tmp_path):
+    snapshot_path, key_path = saved_snapshot(tmp_path)
+    Path(key_path).write_text("")
+    assert rejection_reason(snapshot_path, key_path) == "key_unusable"
+
+
+def test_서명_확인을_건너뛰면_확인_안_된_스냅샷으로_불러온다(tmp_path):
+    snapshot_path, key_path = saved_snapshot(tmp_path)
+    os.remove(key_path)
+
+    snapshot = checker.load_snapshot(snapshot_path, key_path, allow_unsigned=True)
+
+    assert snapshot.unverified_reason == "key_missing"
+    assert snapshot.files == {"a.txt": "h1"}
+
+
+def test_서명_없는_스냅샷도_건너뛰기를_허용하면_불러온다(tmp_path):
+    snapshot_path, key_path = saved_snapshot(tmp_path)
+    data = json.loads(Path(snapshot_path).read_text())
+    del data["signature"]
+    Path(snapshot_path).write_text(json.dumps(data))
+
+    snapshot = checker.load_snapshot(snapshot_path, key_path, allow_unsigned=True)
+
+    assert snapshot.unverified_reason == "unsigned"
+
+
+def test_건너뛰기를_허용해도_서명_불일치는_거부한다(tmp_path):
+    # '확인을 건너뛴다'와 '확인했더니 틀렸다'는 다르다
+    snapshot_path, key_path = saved_snapshot(tmp_path)
+    tamper(snapshot_path, files={"a.txt": "바꿔치기"})
+    assert rejection_reason(snapshot_path, key_path, allow_unsigned=True) == "signature_mismatch"
+
+
+def test_저장_중_실패하면_임시_파일을_남기지_않고_기존_스냅샷을_지킨다(tmp_path, monkeypatch):
+    snapshot_path, key_path = saved_snapshot(tmp_path)
+    original = Path(snapshot_path).read_text()
+
+    def disk_full(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(checker.json, "dump", disk_full)
+
+    with pytest.raises(OSError):
+        checker.save_snapshot(str(tmp_path / "docs"), {"a.txt": "새것"}, (), "k" * 64, snapshot_path)
+
+    assert Path(snapshot_path).read_text() == original
+    assert not Path(checker.snapshot_temp_path(snapshot_path)).exists()
+
+
+def test_저장_중인_임시_파일은_검사에서_뺀다(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / checker.snapshot_temp_path(checker.SNAPSHOT_FILE)).write_text("{}")
+    (tmp_path / "user.txt").write_text("사용자")
+
+    hashes, _ = checker.collect_hashes(str(tmp_path))
+
+    assert list(hashes.keys()) == ["user.txt"]

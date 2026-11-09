@@ -39,14 +39,6 @@ def make_docs(tmp_path, files):
     return docs
 
 
-def tamper_snapshot(tmp_path, **changes):
-    """스냅샷 파일의 항목을 바꿔치기한다 (공격자 흉내)."""
-    snapshot = tmp_path / checker.SNAPSHOT_FILE
-    data = json.loads(snapshot.read_text())
-    data.update(changes)
-    snapshot.write_text(json.dumps(data, ensure_ascii=False))
-
-
 # ─────────────────────────────────────────
 # 1. 종료 코드
 # ─────────────────────────────────────────
@@ -116,23 +108,9 @@ def test_읽을_수_없는_하위_폴더가_있으면_스냅샷을_만들지_않
 
 
 # ─────────────────────────────────────────
-# 3. 망가진 스냅샷·키는 크래시 대신 '검증 실패(3)'
+# 3. 망가진 스냅샷은 크래시 대신 '검증 실패(3)'
+#    (거부 이유별 사례는 test_checker.py 의 스냅샷 저장소 테스트에 있다)
 # ─────────────────────────────────────────
-
-def test_서명값이_문자열이_아니면_검증_실패(tmp_path):
-    make_docs(tmp_path, {"a.txt": "내용"})
-    run("--snapshot", "./docs", cwd=tmp_path)
-    tamper_snapshot(tmp_path, signature=123)
-
-    assert run("--verify", "./docs", cwd=tmp_path).returncode == checker.EXIT_VERIFICATION_FAILED
-
-
-def test_서명값에_ASCII가_아닌_글자가_있어도_검증_실패(tmp_path):
-    make_docs(tmp_path, {"a.txt": "내용"})
-    run("--snapshot", "./docs", cwd=tmp_path)
-    tamper_snapshot(tmp_path, signature="é")
-
-    assert run("--verify", "./docs", cwd=tmp_path).returncode == checker.EXIT_VERIFICATION_FAILED
 
 
 def test_스냅샷을_읽을_권한이_없으면_검증_실패(tmp_path):
@@ -146,35 +124,6 @@ def test_스냅샷을_읽을_권한이_없으면_검증_실패(tmp_path):
         assert "Traceback" not in result.stderr
     finally:
         snapshot.chmod(0o644)
-
-
-def test_UTF8이_아닌_스냅샷은_검증_실패(tmp_path):
-    make_docs(tmp_path, {"a.txt": "내용"})
-    (tmp_path / checker.SNAPSHOT_FILE).write_bytes(b"\xff\xfe garbage")
-
-    result = run("--verify", "./docs", cwd=tmp_path)
-    assert result.returncode == checker.EXIT_VERIFICATION_FAILED
-    assert "Traceback" not in result.stderr
-
-
-def test_빈_키_파일로는_검증하지_않는다(tmp_path):
-    make_docs(tmp_path, {"a.txt": "내용"})
-    run("--snapshot", "./docs", cwd=tmp_path)
-    (tmp_path / checker.KEY_FILE).write_text("")
-
-    result = run("--verify", "./docs", cwd=tmp_path)
-    assert result.returncode == checker.EXIT_VERIFICATION_FAILED
-    assert "무결성이 확인되었습니다" not in result.stdout
-
-
-def test_빈_키_파일로는_스냅샷을_서명하지_않는다(tmp_path):
-    # 빈 키로 서명하면 누구나 같은 서명을 만들 수 있다
-    make_docs(tmp_path, {"a.txt": "내용"})
-    (tmp_path / checker.KEY_FILE).write_text("")
-
-    result = run("--snapshot", "./docs", cwd=tmp_path)
-    assert result.returncode == checker.EXIT_VERIFICATION_FAILED
-    assert not (tmp_path / checker.SNAPSHOT_FILE).exists()
 
 
 # ─────────────────────────────────────────
