@@ -16,6 +16,15 @@ import pytest
 import checker
 
 
+def tool_files_in(tmp_path, key=None):
+    """테스트용 임시 폴더에 도구 파일(스냅샷·로그·비밀키) 위치를 정한다."""
+    return checker.ToolFiles(
+        snapshot=str(tmp_path / checker.SNAPSHOT_FILE),
+        log=str(tmp_path / checker.LOG_FILE),
+        key=key or str(tmp_path / checker.KEY_FILE),
+    )
+
+
 def make_docs(tmp_path, files):
     """tmp_path/docs 아래에 {경로: 내용} 대로 파일을 만든다."""
     docs = tmp_path / "docs"
@@ -296,23 +305,23 @@ def test_읽을_수_없는_검증용_키는_쓸_수_없다(tmp_path):
 # 5. create_snapshot: 기준선 만들기
 # ─────────────────────────────────────────
 
-def test_스냅샷에_서명이_들어간다(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+def test_스냅샷에_서명이_들어간다(tmp_path):
+    tf = tool_files_in(tmp_path)
     make_docs(tmp_path, {"doc1.txt": "원본 내용"})
 
-    checker.create_snapshot("./docs")
+    checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
 
     data = json.loads((tmp_path / checker.SNAPSHOT_FILE).read_text())
     assert "signature" in data
-    assert data["signature"] == checker.compute_signature(data, checker.key_for_verifying(checker.KEY_FILE))
+    assert data["signature"] == checker.compute_signature(data, checker.key_for_verifying(tf.key))
 
 
-def test_읽기_실패가_있으면_스냅샷을_만들지_않는다(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+def test_읽기_실패가_있으면_스냅샷을_만들지_않는다(tmp_path):
+    tf = tool_files_in(tmp_path)
     docs = make_docs(tmp_path, {"blocked.txt": "비밀"})
     (docs / "blocked.txt").chmod(0o000)
     try:
-        code = checker.create_snapshot("./docs")
+        code = checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
         assert code == checker.EXIT_SCAN_INCOMPLETE
         assert not (tmp_path / checker.SNAPSHOT_FILE).exists(), \
             "불완전한 스캔으로 기준선을 만들면 이후 검증을 신뢰할 수 없다"
@@ -320,28 +329,28 @@ def test_읽기_실패가_있으면_스냅샷을_만들지_않는다(tmp_path, m
         (docs / "blocked.txt").chmod(0o644)
 
 
-def test_빈_키_파일로는_스냅샷을_만들지_않는다(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+def test_빈_키_파일로는_스냅샷을_만들지_않는다(tmp_path):
+    tf = tool_files_in(tmp_path)
     make_docs(tmp_path, {"a.txt": "내용"})
     (tmp_path / checker.KEY_FILE).write_text("")
 
-    code = checker.create_snapshot("./docs")
+    code = checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
 
     assert code == checker.EXIT_VERIFICATION_FAILED
     assert not (tmp_path / checker.SNAPSHOT_FILE).exists()
 
 
 def test_스냅샷_저장이_중간에_실패해도_기존_기준선은_남는다(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+    tf = tool_files_in(tmp_path)
     make_docs(tmp_path, {"a.txt": "내용"})
-    checker.create_snapshot("./docs")
+    checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
     original = (tmp_path / checker.SNAPSHOT_FILE).read_text()
 
     def disk_full(*args, **kwargs):
         raise OSError(28, "No space left on device")
     monkeypatch.setattr(checker.json, "dump", disk_full)
 
-    code = checker.create_snapshot("./docs")
+    code = checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
 
     assert code != checker.EXIT_OK
     assert (tmp_path / checker.SNAPSHOT_FILE).read_text() == original
@@ -398,61 +407,61 @@ def test_변경이_있으면_종료코드_1():
 # 7. verify_integrity: 검증과 보고서
 # ─────────────────────────────────────────
 
-def test_변경이_없으면_무결성_확인_메시지를_낸다(tmp_path, monkeypatch, capsys):
-    monkeypatch.chdir(tmp_path)
+def test_변경이_없으면_무결성_확인_메시지를_낸다(tmp_path, capsys):
+    tf = tool_files_in(tmp_path)
     make_docs(tmp_path, {"doc1.txt": "원본"})
 
-    checker.create_snapshot("./docs")
-    checker.verify_integrity("./docs")
+    checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
+    checker.verify_integrity(str(tmp_path / "docs"), tool_files=tf)
 
     assert "모든 파일의 무결성이 확인되었습니다" in capsys.readouterr().out
 
 
-def test_파일_내용이_바뀌면_변조로_잡아낸다(tmp_path, monkeypatch, capsys):
-    monkeypatch.chdir(tmp_path)
+def test_파일_내용이_바뀌면_변조로_잡아낸다(tmp_path, capsys):
+    tf = tool_files_in(tmp_path)
     docs = make_docs(tmp_path, {"doc1.txt": "원본"})
 
-    checker.create_snapshot("./docs")
+    checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
     (docs / "doc1.txt").write_text("몰래 바꾼 내용")
-    checker.verify_integrity("./docs")
+    checker.verify_integrity(str(tmp_path / "docs"), tool_files=tf)
 
     output = capsys.readouterr().out
     assert "변조된 파일 (1개)" in output
     assert "doc1.txt" in output
 
 
-def test_파일이_사라지면_삭제로_잡아낸다(tmp_path, monkeypatch, capsys):
-    monkeypatch.chdir(tmp_path)
+def test_파일이_사라지면_삭제로_잡아낸다(tmp_path, capsys):
+    tf = tool_files_in(tmp_path)
     docs = make_docs(tmp_path, {"doc1.txt": "원본"})
 
-    checker.create_snapshot("./docs")
+    checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
     (docs / "doc1.txt").unlink()
-    checker.verify_integrity("./docs")
+    checker.verify_integrity(str(tmp_path / "docs"), tool_files=tf)
 
     assert "삭제된 파일 (1개)" in capsys.readouterr().out
 
 
-def test_없던_파일이_생기면_추가로_잡아낸다(tmp_path, monkeypatch, capsys):
-    monkeypatch.chdir(tmp_path)
+def test_없던_파일이_생기면_추가로_잡아낸다(tmp_path, capsys):
+    tf = tool_files_in(tmp_path)
     docs = make_docs(tmp_path, {"doc1.txt": "원본"})
 
-    checker.create_snapshot("./docs")
+    checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
     (docs / "backdoor.txt").write_text("해킹 흔적")
-    checker.verify_integrity("./docs")
+    checker.verify_integrity(str(tmp_path / "docs"), tool_files=tf)
 
     output = capsys.readouterr().out
     assert "새로 추가된 파일 (1개)" in output
     assert "backdoor.txt" in output
 
 
-def test_읽기_실패_파일이_삭제로_표시되지_않는다(tmp_path, monkeypatch, capsys):
-    monkeypatch.chdir(tmp_path)
+def test_읽기_실패_파일이_삭제로_표시되지_않는다(tmp_path, capsys):
+    tf = tool_files_in(tmp_path)
     docs = make_docs(tmp_path, {"ok.txt": "정상", "blocked.txt": "비밀"})
 
-    checker.create_snapshot("./docs")
+    checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
     (docs / "blocked.txt").chmod(0o000)
     try:
-        code = checker.verify_integrity("./docs")
+        code = checker.verify_integrity(str(tmp_path / "docs"), tool_files=tf)
         output = capsys.readouterr().out
         assert "삭제된 파일 (1개)" not in output, "읽기 실패를 삭제로 오판함"
         assert "검사하지 못한 파일" in output
@@ -461,51 +470,51 @@ def test_읽기_실패_파일이_삭제로_표시되지_않는다(tmp_path, monk
         (docs / "blocked.txt").chmod(0o644)
 
 
-def test_형식이_잘못된_스냅샷은_크래시_없이_검증_실패(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+def test_형식이_잘못된_스냅샷은_크래시_없이_검증_실패(tmp_path):
+    tf = tool_files_in(tmp_path)
     make_docs(tmp_path, {"doc1.txt": "원본"})
     (tmp_path / checker.SNAPSHOT_FILE).write_text("{}")  # 유효한 JSON 이지만 스냅샷 형식이 아님
 
-    assert checker.verify_integrity("./docs") == checker.EXIT_VERIFICATION_FAILED
+    assert checker.verify_integrity(str(tmp_path / "docs"), tool_files=tf) == checker.EXIT_VERIFICATION_FAILED
 
 
-def test_키가_없으면_검증을_중단하고_성공을_말하지_않는다(tmp_path, monkeypatch, capsys):
-    monkeypatch.chdir(tmp_path)
+def test_키가_없으면_검증을_중단하고_성공을_말하지_않는다(tmp_path, capsys):
+    tf = tool_files_in(tmp_path)
     make_docs(tmp_path, {"a.txt": "내용"})
 
-    checker.create_snapshot("./docs")
+    checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
     (tmp_path / checker.KEY_FILE).unlink()
 
-    code = checker.verify_integrity("./docs")
+    code = checker.verify_integrity(str(tmp_path / "docs"), tool_files=tf)
     output = capsys.readouterr().out
 
     assert "무결성이 확인되었습니다" not in output, "검증 불가 상태에서 성공을 단언함"
     assert code == checker.EXIT_VERIFICATION_FAILED
 
 
-def test_서명이_없는_스냅샷은_검증을_중단한다(tmp_path, monkeypatch, capsys):
-    monkeypatch.chdir(tmp_path)
+def test_서명이_없는_스냅샷은_검증을_중단한다(tmp_path, capsys):
+    tf = tool_files_in(tmp_path)
     make_docs(tmp_path, {"a.txt": "내용"})
 
-    checker.create_snapshot("./docs")
+    checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
     data = json.loads((tmp_path / checker.SNAPSHOT_FILE).read_text())
     del data["signature"]
     (tmp_path / checker.SNAPSHOT_FILE).write_text(json.dumps(data))
 
-    code = checker.verify_integrity("./docs")
+    code = checker.verify_integrity(str(tmp_path / "docs"), tool_files=tf)
 
     assert "무결성이 확인되었습니다" not in capsys.readouterr().out
     assert code == checker.EXIT_VERIFICATION_FAILED
 
 
-def test_allow_unsigned_옵션을_주면_서명_없이도_검증한다(tmp_path, monkeypatch, capsys):
-    monkeypatch.chdir(tmp_path)
+def test_allow_unsigned_옵션을_주면_서명_없이도_검증한다(tmp_path, capsys):
+    tf = tool_files_in(tmp_path)
     make_docs(tmp_path, {"a.txt": "내용"})
 
-    checker.create_snapshot("./docs")
+    checker.create_snapshot(str(tmp_path / "docs"), tool_files=tf)
     (tmp_path / checker.KEY_FILE).unlink()
 
-    code = checker.verify_integrity("./docs", allow_unsigned=True)
+    code = checker.verify_integrity(str(tmp_path / "docs"), allow_unsigned=True, tool_files=tf)
 
     assert code == checker.EXIT_OK
     assert "무결성이 확인되었습니다" in capsys.readouterr().out
@@ -515,39 +524,36 @@ def test_allow_unsigned_옵션을_주면_서명_없이도_검증한다(tmp_path,
 # 8. --key-file: 비밀키를 스냅샷과 다른 곳에 두기
 # ─────────────────────────────────────────
 
-def test_지정한_경로에_키를_만든다(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+def test_지정한_경로에만_키를_만든다(tmp_path):
     vault = tmp_path / "vault"
     vault.mkdir()
     key_path = vault / "integrity.key"
 
     checker.key_for_signing(str(key_path))
 
-    assert key_path.exists()
     assert stat.S_IMODE(os.stat(key_path).st_mode) == 0o600
-    assert not (tmp_path / checker.KEY_FILE).exists(), "기본 위치에도 키를 만들었다"
+    created = sorted(p.relative_to(tmp_path).as_posix() for p in tmp_path.rglob("*"))
+    assert created == ["vault", "vault/integrity.key"], "지정하지 않은 곳에도 파일을 만들었다"
 
 
-def test_지정한_키로_서명하고_같은_키로_검증한다(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    make_docs(tmp_path, {"a.txt": "내용"})
+def test_지정한_키로_서명하고_같은_키로_검증한다(tmp_path):
+    docs = make_docs(tmp_path, {"a.txt": "내용"})
     (tmp_path / "vault").mkdir()
-    key_path = str(tmp_path / "vault" / "integrity.key")
+    tf = tool_files_in(tmp_path, key=str(tmp_path / "vault" / "integrity.key"))
 
-    checker.create_snapshot("./docs", key_file=key_path)
+    checker.create_snapshot(str(docs), tool_files=tf)
 
-    data = json.loads((tmp_path / checker.SNAPSHOT_FILE).read_text())
-    assert data["signature"] == checker.compute_signature(data, checker.key_for_verifying(str(key_path)))
-    assert checker.verify_integrity("./docs", key_file=key_path) == checker.EXIT_OK
+    data = json.loads(Path(tf.snapshot).read_text())
+    assert data["signature"] == checker.compute_signature(data, checker.key_for_verifying(tf.key))
+    assert checker.verify_integrity(str(docs), tool_files=tf) == checker.EXIT_OK
 
 
-def test_검사_폴더_안에_둔_키_파일은_검사에서_뺀다(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
+def test_검사_폴더_안에_둔_키_파일은_검사에서_뺀다(tmp_path):
     docs = make_docs(tmp_path, {"a.txt": "내용"})
     key_path = docs / "my.key"
     key_path.write_text("키")
 
-    hashes, _ = checker.collect_hashes(str(docs), key_file=str(key_path))
+    hashes, _ = checker.collect_hashes(str(docs), tool_files=tool_files_in(tmp_path, key=str(key_path)))
 
     assert list(hashes.keys()) == ["a.txt"]
 
@@ -711,11 +717,46 @@ def test_저장_중_실패하면_임시_파일을_남기지_않고_기존_스냅
     assert not Path(checker.snapshot_temp_path(snapshot_path)).exists()
 
 
-def test_저장_중인_임시_파일은_검사에서_뺀다(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / checker.snapshot_temp_path(checker.SNAPSHOT_FILE)).write_text("{}")
+def test_저장_중인_임시_파일은_검사에서_뺀다(tmp_path):
+    tf = tool_files_in(tmp_path)
+    Path(checker.snapshot_temp_path(tf.snapshot)).write_text("{}")
     (tmp_path / "user.txt").write_text("사용자")
 
-    hashes, _ = checker.collect_hashes(str(tmp_path))
+    hashes, _ = checker.collect_hashes(str(tmp_path), tool_files=tf)
 
     assert list(hashes.keys()) == ["user.txt"]
+
+
+# ─────────────────────────────────────────
+# 10. ToolFiles: 도구 파일의 위치
+# ─────────────────────────────────────────
+
+def test_도구_파일인지_실제_위치로_판단한다(tmp_path):
+    tf = tool_files_in(tmp_path)
+
+    assert tf.includes(tf.snapshot)
+    assert tf.includes(tf.log)
+    assert tf.includes(tf.key)
+    assert tf.includes(checker.snapshot_temp_path(tf.snapshot))
+    # 같은 파일을 다른 표기로 가리켜도 같은 파일로 본다
+    assert tf.includes(str(tmp_path / "sub" / ".." / checker.SNAPSHOT_FILE))
+    assert not tf.includes(str(tmp_path / "user.txt"))
+
+
+def test_만든_뒤에_현재_폴더가_바뀌어도_판단이_흔들리지_않는다(tmp_path, monkeypatch):
+    # 비교용 실제 위치는 만들 때 한 번 확정한다
+    (tmp_path / "work").mkdir()
+    (tmp_path / "elsewhere").mkdir()
+    monkeypatch.chdir(tmp_path / "work")
+    tf = checker.ToolFiles()
+
+    monkeypatch.chdir(tmp_path / "elsewhere")
+
+    assert tf.includes(str(tmp_path / "work" / checker.SNAPSHOT_FILE))
+    assert not tf.includes(str(tmp_path / "elsewhere" / checker.SNAPSHOT_FILE))
+
+
+def test_기본값은_현재_폴더의_도구_파일이고_입력한_형태를_그대로_보여준다():
+    tf = checker.ToolFiles()
+    assert (tf.snapshot, tf.log, tf.key) == (checker.SNAPSHOT_FILE, checker.LOG_FILE, checker.KEY_FILE)
+    assert checker.ToolFiles(key="./usb/k").key == "./usb/k"

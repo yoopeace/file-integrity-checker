@@ -25,9 +25,10 @@ from datetime import datetime  # 날짜/시간 기록
 # ─────────────────────────────────────────
 # 설정값 (원하면 바꿔도 됩니다)
 # ─────────────────────────────────────────
-SNAPSHOT_FILE = "snapshot.json"       # 해시 저장 파일 이름
-LOG_FILE      = "integrity_log.txt"   # 로그 파일 이름
-KEY_FILE      = ".integrity_key"      # 서명용 비밀키 기본 위치 (--key-file 로 바꿀 수 있음, 유출 주의)
+# 도구 파일의 기본 위치. 실제로 쓰는 위치는 ToolFiles 가 정합니다.
+SNAPSHOT_FILE = "snapshot.json"       # 스냅샷
+LOG_FILE      = "integrity_log.txt"   # 검사 기록
+KEY_FILE      = ".integrity_key"      # 서명용 비밀키 (--key-file 로 바꿀 수 있음, 유출 주의)
 
 # ─────────────────────────────────────────
 # 종료 코드 (자동화 도구가 결과를 판단할 수 있게 구분합니다)
@@ -52,7 +53,35 @@ def safe_path(path: str) -> str:
 log = logging.getLogger(__name__)
 
 
-def setup_logging() -> None:
+# ─────────────────────────────────────────
+# 도구 파일
+# ─────────────────────────────────────────
+class ToolFiles:
+    """
+    검사기가 스스로 만들고 쓰는 도구 파일(스냅샷·검사 기록·비밀키)의 위치.
+    프로그램이 시작할 때 한 번 만들어, 필요한 함수에 넘깁니다.
+    아무것도 지정하지 않으면 지금 폴더의 기본 파일을 씁니다.
+
+    위치는 입력한 형태 그대로 보관해 안내 문구에 씁니다.
+    "도구 파일인가?"를 판단할 때 쓰는 실제 위치는 만들 때 한 번 확정해서,
+    그 뒤에 현재 폴더가 바뀌어도 판단이 흔들리지 않게 합니다.
+    """
+
+    def __init__(self, snapshot: str = SNAPSHOT_FILE, log: str = LOG_FILE,
+                 key: str = KEY_FILE):
+        self.snapshot = snapshot
+        self.log = log
+        self.key = key
+        # 저장 중 임시 파일의 이름은 스냅샷 저장소가 정하므로 그쪽에 묻습니다
+        locations = (snapshot, snapshot_temp_path(snapshot), log, key)
+        self._real_paths = frozenset(os.path.realpath(p) for p in locations)
+
+    def includes(self, path: str) -> bool:
+        """path 가 도구 파일이면 True. 같은 파일을 다른 표기로 가리켜도 알아봅니다."""
+        return os.path.realpath(path) in self._real_paths
+
+
+def setup_logging(tool_files: ToolFiles) -> None:
     """검사 이력을 로그 파일에 남깁니다.
 
     import 시점이 아니라 실행할 때 설정해야 --help 만 봐도 파일이 생기는 일이 없습니다.
@@ -62,7 +91,7 @@ def setup_logging() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s  %(levelname)s  %(message)s",
-        handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8")],
+        handlers=[logging.FileHandler(tool_files.log, encoding="utf-8")],
     )
 
 
@@ -109,7 +138,7 @@ def fingerprint(filepath: str) -> str:
 # ─────────────────────────────────────────
 # 핵심 함수 2: 폴더 내 모든 파일 해시 수집
 # ─────────────────────────────────────────
-def collect_hashes(directory: str, exclude_dirs=(), key_file: str = KEY_FILE) -> tuple:
+def collect_hashes(directory: str, exclude_dirs=(), tool_files: ToolFiles | None = None) -> tuple:
     """
     지정한 폴더 안의 모든 파일에 대해 해시를 계산합니다.
 
@@ -126,8 +155,7 @@ def collect_hashes(directory: str, exclude_dirs=(), key_file: str = KEY_FILE) ->
 
     # 도구가 실제로 만든 파일만 경로로 판단해 제외합니다.
     # 이름만 보고 제외하면 사용자의 backup/snapshot.json 까지 검사에서 빠집니다.
-    tool_files = (SNAPSHOT_FILE, snapshot_temp_path(SNAPSHOT_FILE), LOG_FILE, key_file)
-    tool_paths = {os.path.realpath(p) for p in tool_files}
+    tool_files = tool_files or ToolFiles()
 
     def record_unreadable_dir(error: OSError) -> None:
         # os.walk 는 열지 못한 폴더를 기본적으로 조용히 건너뜁니다.
@@ -143,7 +171,7 @@ def collect_hashes(directory: str, exclude_dirs=(), key_file: str = KEY_FILE) ->
 
         for filename in files + linked_dirs:
             filepath = os.path.join(root, filename)
-            if os.path.realpath(filepath) in tool_paths:
+            if tool_files.includes(filepath):
                 continue
 
             # 폴더 경로를 제거한 상대 경로를 키로 사용
@@ -371,15 +399,15 @@ def load_snapshot(snapshot_path: str = SNAPSHOT_FILE, key_file: str = KEY_FILE,
 # ─────────────────────────────────────────
 # 기능 A: 스냅샷 저장
 # ─────────────────────────────────────────
-def report_key_unavailable(error: Exception, key_file: str) -> int:
+def report_key_unavailable(error, tool_files: ToolFiles) -> int:
     """비밀키를 쓸 수 없을 때의 안내. 종료 코드를 돌려줍니다."""
     print(f"\n❌ 비밀키를 사용할 수 없습니다: {error}")
-    print(f"   {safe_path(key_file)} 를 확인해 주세요.\n")
+    print(f"   {safe_path(tool_files.key)} 를 확인해 주세요.\n")
     log.error(f"  비밀키 사용 불가: {error}")
     return EXIT_VERIFICATION_FAILED
 
 
-def create_snapshot(directory: str, exclude_dirs=(), key_file: str = KEY_FILE) -> int:
+def create_snapshot(directory: str, exclude_dirs=(), tool_files: ToolFiles | None = None) -> int:
     """
     현재 상태(해시 딕셔너리)를 서명해서 snapshot.json에 저장합니다.
     이것이 나중에 비교할 '기준선(baseline)'이 됩니다.
@@ -389,8 +417,9 @@ def create_snapshot(directory: str, exclude_dirs=(), key_file: str = KEY_FILE) -
         print("   경로를 다시 확인해 주세요.\n")
         return EXIT_USAGE_ERROR
 
+    tool_files = tool_files or ToolFiles()
     log.info(f"=== 스냅샷 생성 시작: {directory} ===")
-    hashes, errors = collect_hashes(directory, exclude_dirs, key_file)
+    hashes, errors = collect_hashes(directory, exclude_dirs, tool_files)
 
     # 일부를 읽지 못한 상태로 기준선을 만들면 이후 검증 결과를 신뢰할 수 없습니다
     if errors:
@@ -402,23 +431,23 @@ def create_snapshot(directory: str, exclude_dirs=(), key_file: str = KEY_FILE) -
         return EXIT_SCAN_INCOMPLETE
 
     try:
-        key, key_created = key_for_signing(key_file)
+        key, key_created = key_for_signing(tool_files.key)
     except KeyUnavailable as e:
-        return report_key_unavailable(e, key_file)
+        return report_key_unavailable(e, tool_files)
     if key_created:
         # 키를 다른 곳에 둘수록 어디에 만들어졌는지 놓치기 쉬우므로 화면에 알립니다
-        print(f"\n🔑 새 비밀키를 만들었습니다: {safe_path(key_file)}")
+        print(f"\n🔑 새 비밀키를 만들었습니다: {safe_path(tool_files.key)}")
         print("   이 키가 있어야 검증할 수 있습니다. 검사 대상과 다른 곳에 안전하게 보관하세요.")
 
     try:
-        save_snapshot(directory, hashes, exclude_dirs, key)
+        save_snapshot(directory, hashes, exclude_dirs, key, tool_files.snapshot)
     except OSError as e:
         print(f"\n❌ 스냅샷을 저장하지 못했습니다: {e}")
         print("   이전 스냅샷이 있었다면 그대로 남아 있습니다.\n")
         log.error(f"=== 스냅샷 저장 실패: {e} ===")
         return EXIT_USAGE_ERROR
 
-    log.info(f"=== 스냅샷 완료: {len(hashes)}개 파일 → {SNAPSHOT_FILE} ===")
+    log.info(f"=== 스냅샷 완료: {len(hashes)}개 파일 → {tool_files.snapshot} ===")
     print(f"\n✅ 스냅샷 저장 완료: {len(hashes)}개 파일이 기록되었습니다.")
     return EXIT_OK
 
@@ -523,22 +552,22 @@ def print_report(result: Comparison, created_at: str, scanned_count: int) -> Non
         print(f"\n🚨 총 {total}건의 변경이 감지되었습니다. 로그를 확인하세요.\n")
 
 
-def report_rejection(error: SnapshotRejected, key_file: str) -> int:
+def report_rejection(error: SnapshotRejected, tool_files: ToolFiles) -> int:
     """스냅샷 저장소가 거부한 이유를 안내 문구와 종료 코드로 바꿉니다."""
     if error.reason == "missing":
-        print(f"\n❌ 스냅샷 파일({SNAPSHOT_FILE})이 없습니다.")
+        print(f"\n❌ 스냅샷 파일({safe_path(tool_files.snapshot)})이 없습니다.")
         print("   먼저 --snapshot 옵션으로 기준선을 만들어 주세요.\n")
         return EXIT_USAGE_ERROR
     if error.reason == "unreadable":
-        print(f"\n❌ 스냅샷 파일({SNAPSHOT_FILE})을 읽을 수 없습니다: {safe_path(error.detail)}")
+        print(f"\n❌ 스냅샷 파일({safe_path(tool_files.snapshot)})을 읽을 수 없습니다: {safe_path(error.detail)}")
         print("   손상되었다면 --snapshot 옵션으로 다시 생성해 주세요.\n")
         return EXIT_VERIFICATION_FAILED
     if error.reason == "malformed":
-        print(f"\n❌ 스냅샷 파일({SNAPSHOT_FILE})의 형식이 올바르지 않습니다.")
+        print(f"\n❌ 스냅샷 파일({safe_path(tool_files.snapshot)})의 형식이 올바르지 않습니다.")
         print("   --snapshot 옵션으로 다시 생성해 주세요.\n")
         return EXIT_VERIFICATION_FAILED
     if error.reason in ("unsigned", "key_missing"):
-        reason = unverified_description(error.reason, key_file)
+        reason = unverified_description(error.reason, tool_files)
         print(f"\n🚨 검증을 중단합니다: {reason}.")
         print("   스냅샷 자체의 위변조 여부를 확인할 수 없어 결과를 신뢰할 수 없습니다.")
         if error.reason == "key_missing":
@@ -548,9 +577,9 @@ def report_rejection(error: SnapshotRejected, key_file: str) -> int:
         log.error(f"  서명 검증 불가({reason}) - 검증 중단")
         return EXIT_VERIFICATION_FAILED
     if error.reason == "key_unusable":
-        return report_key_unavailable(error.detail, key_file)
+        return report_key_unavailable(error.detail, tool_files)
     # signature_mismatch
-    print(f"\n🚨 경고: 스냅샷 파일({SNAPSHOT_FILE})의 서명이 일치하지 않습니다!")
+    print(f"\n🚨 경고: 스냅샷 파일({safe_path(tool_files.snapshot)})의 서명이 일치하지 않습니다!")
     print("   스냅샷 자체가 위변조되었을 가능성이 있어 검증을 중단합니다.")
     print("   (키를 여러 개 쓴다면, 스냅샷을 만들 때 쓴 키를 --key-file 로 지정했는지 확인해 주세요.)")
     print("   신뢰할 수 있는 기준선이 필요하면 --snapshot 으로 다시 생성해 주세요.\n")
@@ -558,15 +587,15 @@ def report_rejection(error: SnapshotRejected, key_file: str) -> int:
     return EXIT_VERIFICATION_FAILED
 
 
-def unverified_description(reason: str, key_file: str) -> str:
+def unverified_description(reason: str, tool_files: ToolFiles) -> str:
     """서명을 확인하지 못한 이유를 사람이 읽을 문장으로."""
     if reason == "unsigned":
         return "서명이 없는 스냅샷입니다 (구버전에서 생성)"
-    return f"비밀키 파일({safe_path(key_file)})이 없습니다"
+    return f"비밀키 파일({safe_path(tool_files.key)})이 없습니다"
 
 
 def verify_integrity(directory: str, exclude_dirs=None, allow_unsigned: bool = False,
-                     key_file: str = KEY_FILE) -> int:
+                     tool_files: ToolFiles | None = None) -> int:
     """
     현재 상태와 스냅샷을 비교해 변조/추가/삭제된 파일을 탐지합니다.
     이것이 디지털 포렌식의 핵심 개념입니다!
@@ -574,11 +603,13 @@ def verify_integrity(directory: str, exclude_dirs=None, allow_unsigned: bool = F
     exclude_dirs 를 생략하면 스냅샷에 기록된 제외 설정을 그대로 씁니다.
     다른 값을 주면 거부합니다.
     """
+    tool_files = tool_files or ToolFiles()
+
     # 1) 스냅샷 읽기·서명 확인
     try:
-        snapshot = load_snapshot(SNAPSHOT_FILE, key_file, allow_unsigned)
+        snapshot = load_snapshot(tool_files.snapshot, tool_files.key, allow_unsigned)
     except SnapshotRejected as e:
-        return report_rejection(e, key_file)
+        return report_rejection(e, tool_files)
 
     if not os.path.isdir(directory):
         print(f"\n❌ 폴더를 찾을 수 없습니다: {safe_path(directory)}")
@@ -586,7 +617,7 @@ def verify_integrity(directory: str, exclude_dirs=None, allow_unsigned: bool = F
         return EXIT_USAGE_ERROR
 
     if snapshot.unverified_reason:
-        reason = unverified_description(snapshot.unverified_reason, key_file)
+        reason = unverified_description(snapshot.unverified_reason, tool_files)
         print(f"\n⚠️  주의: {reason}. --allow-unsigned 지정으로 검증을 계속합니다.")
         print("   스냅샷 자체의 위변조 여부는 확인되지 않았습니다.")
         log.warning(f"  서명 검증 생략({reason}) - allow_unsigned")
@@ -614,7 +645,7 @@ def verify_integrity(directory: str, exclude_dirs=None, allow_unsigned: bool = F
         log.warning(f"  대상 폴더 불일치 - 스냅샷: {baseline_dir} / 검증: {os.path.abspath(directory)}")
 
     # 2) 현재 상태를 읽어 비교
-    current_hashes, scan_errors = collect_hashes(directory, set(snapshot.exclude_dirs), key_file)
+    current_hashes, scan_errors = collect_hashes(directory, set(snapshot.exclude_dirs), tool_files)
     result = compare(snapshot.files, current_hashes, scan_errors)
 
     for f in result.deleted:
@@ -657,13 +688,14 @@ def main():
                         help="서명이나 비밀키가 없어도 검증을 진행합니다 (신뢰도가 낮아집니다).")
 
     args = parser.parse_args()
-    setup_logging()
+    tool_files = ToolFiles(key=args.key_file)
+    setup_logging(tool_files)
 
     if args.snapshot:
-        return create_snapshot(args.snapshot, set(args.exclude), args.key_file)
+        return create_snapshot(args.snapshot, set(args.exclude), tool_files)
     if args.verify:
         return verify_integrity(args.verify, set(args.exclude) if args.exclude else None,
-                                args.allow_unsigned, args.key_file)
+                                args.allow_unsigned, tool_files)
 
     parser.print_help()
     return EXIT_USAGE_ERROR
