@@ -136,7 +136,7 @@ python3 checker.py --verify   ./검사할폴더 --key-file /Volumes/USB/integrit
 
 ## 테스트
 
-전체 테스트(100건) 실행:
+전체 테스트(105건) 실행:
 
 ```bash
 python3 -m venv .venv

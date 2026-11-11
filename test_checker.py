@@ -94,9 +94,9 @@ def test_빈_파일도_해시를_만든다(tmp_path):
 
 def test_해시와_오류를_함께_돌려준다(tmp_path):
     (tmp_path / "a.txt").write_text("내용")
-    hashes, errors = checker.collect_hashes(str(tmp_path))
-    assert "a.txt" in hashes
-    assert errors == {}
+    scan = checker.collect_hashes(str(tmp_path))
+    assert "a.txt" in scan.hashes
+    assert scan.errors == {}
 
 
 def test_하위_폴더의_파일까지_찾는다(tmp_path):
@@ -104,7 +104,7 @@ def test_하위_폴더의_파일까지_찾는다(tmp_path):
     (tmp_path / "top.txt").write_text("위")
     (tmp_path / "sub" / "inner.txt").write_text("아래")
 
-    hashes, _ = checker.collect_hashes(str(tmp_path))
+    hashes = checker.collect_hashes(str(tmp_path)).hashes
 
     # 경로 구분자는 운영체제마다 다르므로 비교 전에 통일한다
     found = {Path(key).as_posix() for key in hashes}
@@ -113,7 +113,7 @@ def test_하위_폴더의_파일까지_찾는다(tmp_path):
 
 
 def test_빈_폴더는_빈_결과를_돌려준다(tmp_path):
-    assert checker.collect_hashes(str(tmp_path)) == ({}, {})
+    assert checker.collect_hashes(str(tmp_path)) == checker.Scan({}, {})
 
 
 def test_읽을_수_없는_파일은_오류로_기록된다(tmp_path):
@@ -121,9 +121,9 @@ def test_읽을_수_없는_파일은_오류로_기록된다(tmp_path):
     blocked.write_text("비밀")
     blocked.chmod(0o000)
     try:
-        hashes, errors = checker.collect_hashes(str(tmp_path))
-        assert "blocked.txt" not in hashes
-        assert "blocked.txt" in errors
+        scan = checker.collect_hashes(str(tmp_path))
+        assert "blocked.txt" not in scan.hashes
+        assert "blocked.txt" in scan.errors
     finally:
         blocked.chmod(0o644)
 
@@ -132,8 +132,8 @@ def test_읽을_수_없는_하위_폴더는_검사_실패로_기록된다(tmp_pa
     docs = make_docs(tmp_path, {"top.txt": "위", "sub/a.txt": "아래"})
     (docs / "sub").chmod(0o000)
     try:
-        hashes, errors = checker.collect_hashes(str(docs))
-        assert "sub" in errors, "열지 못한 폴더가 조용히 건너뛰어졌다"
+        scan = checker.collect_hashes(str(docs))
+        assert "sub" in scan.errors, "열지 못한 폴더가 조용히 건너뛰어졌다"
     finally:
         (docs / "sub").chmod(0o755)
 
@@ -143,7 +143,7 @@ def test_숨김_폴더의_파일도_검사한다(tmp_path):
     hidden.mkdir()
     (hidden / "credentials.txt").write_text("비밀 정보")
 
-    hashes, _ = checker.collect_hashes(str(tmp_path))
+    hashes = checker.collect_hashes(str(tmp_path)).hashes
 
     assert ".config/credentials.txt" in {Path(k).as_posix() for k in hashes}
 
@@ -153,7 +153,7 @@ def test_exclude로_지정한_폴더만_건너뛴다(tmp_path):
     (tmp_path / ".git" / "config").write_text("깃 내부")
     (tmp_path / "real.txt").write_text("진짜")
 
-    hashes, _ = checker.collect_hashes(str(tmp_path), exclude_dirs={".git"})
+    hashes = checker.collect_hashes(str(tmp_path), exclude_dirs={".git"}).hashes
 
     assert list(hashes.keys()) == ["real.txt"]
 
@@ -164,7 +164,7 @@ def test_하위_폴더의_동일_이름_파일은_검사한다(tmp_path):
     backup.mkdir()
     (backup / checker.SNAPSHOT_FILE).write_text("사용자 데이터")
 
-    hashes, _ = checker.collect_hashes(str(tmp_path))
+    hashes = checker.collect_hashes(str(tmp_path)).hashes
 
     assert f"backup/{checker.SNAPSHOT_FILE}" in {Path(k).as_posix() for k in hashes}
 
@@ -176,9 +176,50 @@ def test_도구가_만든_파일은_경로로_판단해_제외한다(tmp_path, m
     (tmp_path / checker.KEY_FILE).write_text("키")
     (tmp_path / "user.txt").write_text("사용자")
 
-    hashes, _ = checker.collect_hashes(str(tmp_path))
+    hashes = checker.collect_hashes(str(tmp_path)).hashes
 
     assert list(hashes.keys()) == ["user.txt"]
+
+
+# ─────────────────────────────────────────
+# 3-1. Scan: 스캔 결과가 '검사 불가' 여부를 스스로 답한다
+# ─────────────────────────────────────────
+
+def test_읽지_못한_파일_자신은_검사_불가다():
+    scan = checker.Scan({}, {"a.txt": "Permission denied"})
+    assert scan.is_unverifiable("a.txt")
+    assert not scan.is_unverifiable("b.txt")
+
+
+def test_읽지_못한_폴더_안의_경로는_모두_검사_불가다():
+    scan = checker.Scan({}, {"sub": "Permission denied"})
+    assert scan.is_unverifiable(os.path.join("sub", "c.txt"))
+    assert scan.is_unverifiable(os.path.join("sub", "deep", "d.txt"))
+
+
+def test_이름만_비슷한_폴더는_검사_불가로_보지_않는다():
+    # 'sub' 를 못 읽었다고 'subway' 안의 파일까지 판정을 포기하면 안 된다
+    scan = checker.Scan({}, {"sub": "Permission denied"})
+    assert not scan.is_unverifiable(os.path.join("subway", "a.txt"))
+    assert not scan.is_unverifiable("sub.txt")
+
+
+def test_검사_폴더_자체를_못_읽으면_모든_경로가_검사_불가다():
+    # 검사 폴더 자체를 열지 못하면 실패 목록에 '.' 으로 기록된다
+    scan = checker.Scan({}, {".": "Permission denied"})
+    assert scan.is_unverifiable("a.txt")
+    assert scan.is_unverifiable(os.path.join("sub", "c.txt"))
+
+
+def test_검사_폴더_자체를_못_열면_점으로_기록된다(tmp_path):
+    docs = make_docs(tmp_path, {"a.txt": "내용"})
+    docs.chmod(0o000)
+    try:
+        scan = checker.collect_hashes(str(docs))
+    finally:
+        docs.chmod(0o755)
+    assert list(scan.errors) == ["."]
+    assert scan.is_unverifiable("a.txt")
 
 
 # ─────────────────────────────────────────
@@ -364,7 +405,7 @@ def test_변조_삭제_추가를_구분한다():
     old = {"a.txt": "h1", "b.txt": "h2", "c.txt": "h3"}
     new = {"a.txt": "h1", "b.txt": "바뀜", "d.txt": "h4"}
 
-    result = checker.compare(old, new, scan_errors={})
+    result = checker.compare(old, checker.Scan(new, {}))
 
     assert result.modified == ["b.txt"]
     assert result.deleted == ["c.txt"]
@@ -374,32 +415,32 @@ def test_변조_삭제_추가를_구분한다():
 
 def test_바뀐_것이_없으면_변경_0건():
     same = {"a.txt": "h1"}
-    result = checker.compare(same, dict(same), scan_errors={})
+    result = checker.compare(same, checker.Scan(dict(same), {}))
     assert result.change_count == 0
     assert result.exit_code() == checker.EXIT_OK
 
 
 def test_읽지_못한_파일은_삭제로_세지_않는다():
-    result = checker.compare({"a.txt": "h1"}, {}, scan_errors={"a.txt": "Permission denied"})
+    result = checker.compare({"a.txt": "h1"}, checker.Scan({}, {"a.txt": "Permission denied"}))
     assert result.deleted == []
     assert result.unverifiable == {"a.txt": "Permission denied"}
 
 
 def test_읽지_못한_폴더_안의_파일도_삭제로_세지_않는다():
     old = {os.path.join("sub", "c.txt"): "h1", "a.txt": "h2"}
-    result = checker.compare(old, {"a.txt": "h2"}, scan_errors={"sub": "Permission denied"})
+    result = checker.compare(old, checker.Scan({"a.txt": "h2"}, {"sub": "Permission denied"}))
     assert result.deleted == []
 
 
 def test_검사하지_못한_항목이_있으면_변경이_있어도_종료코드_4():
-    result = checker.compare({"a.txt": "h1", "b.txt": "h2"}, {"a.txt": "바뀜"},
-                             scan_errors={"b.txt": "Permission denied"})
+    result = checker.compare({"a.txt": "h1", "b.txt": "h2"},
+                             checker.Scan({"a.txt": "바뀜"}, {"b.txt": "Permission denied"}))
     assert result.modified == ["a.txt"]
     assert result.exit_code() == checker.EXIT_SCAN_INCOMPLETE
 
 
 def test_변경이_있으면_종료코드_1():
-    result = checker.compare({"a.txt": "h1"}, {"a.txt": "바뀜"}, scan_errors={})
+    result = checker.compare({"a.txt": "h1"}, checker.Scan({"a.txt": "바뀜"}, {}))
     assert result.exit_code() == checker.EXIT_CHANGES_DETECTED
 
 
@@ -619,7 +660,7 @@ def test_검사_폴더_안에_둔_키_파일은_검사에서_뺀다(tmp_path):
     key_path = docs / "my.key"
     key_path.write_text("키")
 
-    hashes, _ = checker.collect_hashes(str(docs), tool_files=tool_files_in(tmp_path, key=str(key_path)))
+    hashes = checker.collect_hashes(str(docs), tool_files=tool_files_in(tmp_path, key=str(key_path))).hashes
 
     assert list(hashes.keys()) == ["a.txt"]
 
@@ -788,7 +829,7 @@ def test_저장_중인_임시_파일은_검사에서_뺀다(tmp_path):
     Path(checker.snapshot_temp_path(tf.snapshot)).write_text("{}")
     (tmp_path / "user.txt").write_text("사용자")
 
-    hashes, _ = checker.collect_hashes(str(tmp_path), tool_files=tf)
+    hashes = checker.collect_hashes(str(tmp_path), tool_files=tf).hashes
 
     assert list(hashes.keys()) == ["user.txt"]
 

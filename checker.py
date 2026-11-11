@@ -138,13 +138,34 @@ def fingerprint(filepath: str) -> str:
 # ─────────────────────────────────────────
 # 핵심 함수 2: 폴더 내 모든 파일 해시 수집
 # ─────────────────────────────────────────
-def collect_hashes(directory: str, exclude_dirs=(), tool_files: ToolFiles | None = None) -> tuple:
+@dataclass(frozen=True)
+class Scan:
+    """
+    폴더를 한 번 훑은 결과.
+
+    hashes : {상대경로: 지문}
+    errors : {상대경로: 실패 이유}  읽지 못한 파일·폴더. 검사 폴더 자체를 못 열면 "." 으로 기록됩니다.
+
+    실패 목록을 어떻게 기록하는지(collect_hashes)와 어떻게 해석하는지(is_unverifiable)를
+    이 값 한 곳에 둡니다. 둘이 떨어져 있으면 한쪽 규칙만 바뀌어도 알아챌 수 없습니다.
+    """
+    hashes: dict
+    errors: dict
+
+    def is_unverifiable(self, path: str) -> bool:
+        """path 자체를, 또는 path 가 들어 있는 폴더를 읽지 못했는지 확인합니다."""
+        return any(
+            path == failed or failed == "." or path.startswith(failed + os.sep)
+            for failed in self.errors
+        )
+
+
+def collect_hashes(directory: str, exclude_dirs=(), tool_files: ToolFiles | None = None) -> Scan:
     """
     지정한 폴더 안의 모든 파일에 대해 해시를 계산합니다.
 
-    반환값은 ({상대경로: 해시값}, {상대경로: 실패이유}) 두 개입니다.
     읽지 못한 파일을 조용히 건너뛰면 이후 비교에서 '삭제됨'으로 오판하게 되므로
-    실패 목록을 따로 돌려주어 호출한 쪽이 판단하게 합니다.
+    실패 목록도 함께 돌려주어 호출한 쪽이 판단하게 합니다.
 
     숨김 폴더도 기본으로 검사합니다. 보안 검사에서는 오히려 숨김 폴더에
     중요한 파일이 있을 수 있으므로, 제외는 exclude_dirs 로 명시해야 합니다.
@@ -184,15 +205,7 @@ def collect_hashes(directory: str, exclude_dirs=(), tool_files: ToolFiles | None
                 errors[relative_path] = str(e)
                 log.error(f"  검사 실패: {safe_path(relative_path)} → {e}")
 
-    return hashes, errors
-
-
-def is_unverifiable(path: str, errors: dict) -> bool:
-    """path 자체를, 또는 path 가 들어 있는 폴더를 읽지 못했는지 확인합니다."""
-    return any(
-        path == failed or failed == "." or path.startswith(failed + os.sep)
-        for failed in errors
-    )
+    return Scan(hashes, errors)
 
 
 # ─────────────────────────────────────────
@@ -418,15 +431,15 @@ def create_snapshot(directory: str, exclude_dirs=(), tool_files: ToolFiles | Non
 
     tool_files = tool_files or ToolFiles()
     log.info(f"=== 스냅샷 생성 시작: {directory} ===")
-    hashes, errors = collect_hashes(directory, exclude_dirs, tool_files)
+    scan = collect_hashes(directory, exclude_dirs, tool_files)
 
     # 일부를 읽지 못한 상태로 기준선을 만들면 이후 검증 결과를 신뢰할 수 없습니다
-    if errors:
-        print(f"\n❌ 검사하지 못한 파일·폴더가 {len(errors)}개 있어 스냅샷을 만들지 않았습니다.")
-        for path, reason in errors.items():
+    if scan.errors:
+        print(f"\n❌ 검사하지 못한 파일·폴더가 {len(scan.errors)}개 있어 스냅샷을 만들지 않았습니다.")
+        for path, reason in scan.errors.items():
             print(f"   • {safe_path(path)} → {safe_path(reason)}")
         print("   권한을 확인한 뒤 다시 시도해 주세요.\n")
-        log.error(f"=== 스냅샷 중단: 검사 실패 {len(errors)}건 ===")
+        log.error(f"=== 스냅샷 중단: 검사 실패 {len(scan.errors)}건 ===")
         return EXIT_SCAN_INCOMPLETE
 
     try:
@@ -440,15 +453,15 @@ def create_snapshot(directory: str, exclude_dirs=(), tool_files: ToolFiles | Non
         print("   이 키가 있어야 검증할 수 있습니다. 검사 대상과 다른 곳에 안전하게 보관하세요.")
 
     try:
-        save_snapshot(directory, hashes, exclude_dirs, key, tool_files.snapshot)
+        save_snapshot(directory, scan.hashes, exclude_dirs, key, tool_files.snapshot)
     except OSError as e:
         print(f"\n❌ 스냅샷을 저장하지 못했습니다: {e}")
         print("   이전 스냅샷이 있었다면 그대로 남아 있습니다.\n")
         log.error(f"=== 스냅샷 저장 실패: {e} ===")
         return EXIT_USAGE_ERROR
 
-    log.info(f"=== 스냅샷 완료: {len(hashes)}개 파일 → {tool_files.snapshot} ===")
-    print(f"\n✅ 스냅샷 저장 완료: {len(hashes)}개 파일이 기록되었습니다.")
+    log.info(f"=== 스냅샷 완료: {len(scan.hashes)}개 파일 → {tool_files.snapshot} ===")
+    print(f"\n✅ 스냅샷 저장 완료: {len(scan.hashes)}개 파일이 기록되었습니다.")
     return EXIT_OK
 
 
@@ -520,25 +533,25 @@ class VerifyOutcome:
         return self.comparison.exit_code()
 
 
-def compare(old_hashes: dict, current_hashes: dict, scan_errors: dict) -> Comparison:
+def compare(old_hashes: dict, current: Scan) -> Comparison:
     """
-    기준선(old)과 현재(current) 해시를 비교합니다.
-    파일을 읽지 않고 사전만 다루므로, 테스트에서 값으로 바로 확인할 수 있습니다.
+    기준선(old_hashes)과 지금 훑은 결과(current)를 비교합니다.
+    파일을 읽지 않고 값만 다루므로, 테스트에서 Scan 을 직접 만들어 바로 확인할 수 있습니다.
     """
     modified = []
     deleted = []
     for filepath, old_hash in old_hashes.items():
         # 읽지 못한 파일(또는 읽지 못한 폴더 안의 파일)은 '삭제'가 아니라 '검사 실패'입니다.
         # 둘을 섞으면 멀쩡히 있는 파일을 삭제됐다고 보고하게 됩니다.
-        if is_unverifiable(filepath, scan_errors):
+        if current.is_unverifiable(filepath):
             continue
-        if filepath not in current_hashes:
+        if filepath not in current.hashes:
             deleted.append(filepath)
-        elif current_hashes[filepath] != old_hash:
+        elif current.hashes[filepath] != old_hash:
             modified.append(filepath)
 
-    added = [filepath for filepath in current_hashes if filepath not in old_hashes]
-    return Comparison(modified, deleted, added, dict(scan_errors))
+    added = [filepath for filepath in current.hashes if filepath not in old_hashes]
+    return Comparison(modified, deleted, added, dict(current.errors))
 
 
 def print_report(result: Comparison, created_at: str, scanned_count: int) -> None:
@@ -674,10 +687,10 @@ def run_verification(directory: str, exclude_dirs=None, allow_unsigned: bool = F
         log.warning(f"  대상 폴더 불일치 - 스냅샷: {snapshot.target_directory} / 검증: {current_dir}")
 
     # 2) 현재 상태를 읽어 비교
-    current_hashes, scan_errors = collect_hashes(directory, set(snapshot.exclude_dirs), tool_files)
-    result = compare(snapshot.files, current_hashes, scan_errors)
+    current = collect_hashes(directory, set(snapshot.exclude_dirs), tool_files)
+    result = compare(snapshot.files, current)
     outcome.comparison = result
-    outcome.scanned_count = len(current_hashes)
+    outcome.scanned_count = len(current.hashes)
 
     for f in result.deleted:
         log.warning(f"  [삭제] {safe_path(f)}")
