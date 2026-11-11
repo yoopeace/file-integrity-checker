@@ -8,6 +8,7 @@
 
 import json
 import os
+import re
 import stat
 from pathlib import Path
 
@@ -625,6 +626,34 @@ def test_주의가_거부_안내보다_먼저_나온다(tmp_path, capsys):
 
     output = capsys.readouterr().out
     assert output.index("주의") < output.index("제외 설정이 스냅샷과 다릅니다")
+
+
+def test_보고서의_두_시각은_같은_형식으로_초까지만_보인다(tmp_path, capsys):
+    docs, tf = snapshot_docs(tmp_path, {"a.txt": "내용"})
+    capsys.readouterr()
+
+    checker.verify_integrity(str(docs), tool_files=tf)
+
+    output = capsys.readouterr().out
+    same_format = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\n"
+    assert re.search(r"스냅샷 기준 시각: " + same_format, output), output
+    assert re.search(r"검사 완료 시각:   " + same_format, output), output
+
+
+@pytest.mark.parametrize("stored, shown", [
+    ("2026-11-11T11:39:54.265421", "2026-11-11 11:39:54"),   # 지금 버전이 저장하는 형식
+    ("2026-01-01T10:00:00", "2026-01-01 10:00:00"),          # 마이크로초가 없는 형식
+    ("알 수 없음", "알 수 없음"),                              # 시각을 읽지 못한 경우
+])
+def test_스냅샷_시각을_화면_형식으로_바꾼다(stored, shown):
+    assert checker.display_time(stored) == shown
+
+
+def test_시각이_아닌_값은_정제해서_그대로_보인다():
+    # --allow-unsigned 로 쓴 스냅샷은 created_at 이 조작됐을 수 있다
+    shown = checker.display_time("\x1b[31m조작된 값")
+    assert "\x1b" not in shown
+    assert "조작된 값" in shown
 
 
 # ─────────────────────────────────────────

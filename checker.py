@@ -554,13 +554,29 @@ def compare(old_hashes: dict, current: Scan) -> Comparison:
     return Comparison(modified, deleted, added, dict(current.errors))
 
 
+# 보고서에 찍는 시각 형식. 스냅샷 기준 시각과 검사 완료 시각을 같은 모양으로 보여 줍니다.
+DISPLAY_TIME_FORMAT = '%Y-%m-%d %H:%M:%S'
+
+
+def display_time(stored: str) -> str:
+    """
+    스냅샷에 저장된 시각(ISO 형식, 마이크로초 포함)을 보고서용 형식으로 바꿉니다.
+    저장된 값은 서명 대상이라 그대로 두고, 화면에 보일 때만 바꿉니다.
+    시각으로 읽을 수 없는 값('알 수 없음', 조작된 값)은 정제만 해서 그대로 보여 줍니다.
+    """
+    try:
+        return datetime.fromisoformat(stored).strftime(DISPLAY_TIME_FORMAT)
+    except (TypeError, ValueError):
+        return safe_path(stored)
+
+
 def print_report(result: Comparison, created_at: str, scanned_count: int) -> None:
     """비교 결과를 보고서 형식으로 화면에 출력합니다."""
     print("\n" + "="*50)
     print("    📋 무결성 검사 결과 보고서")
     print("="*50)
     print(f"  스냅샷 기준 시각: {created_at}")
-    print(f"  검사 완료 시각:   {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  검사 완료 시각:   {datetime.now().strftime(DISPLAY_TIME_FORMAT)}")
     print(f"  검사 파일 수:     {scanned_count}개")
     print("-"*50)
 
@@ -720,7 +736,7 @@ def print_verify_outcome(outcome: VerifyOutcome, tool_files: ToolFiles) -> None:
     refusal = outcome.refusal
     if refusal is None:
         # 스냅샷에서 읽은 값은 화면에 찍기 전에 정제합니다 (--allow-unsigned 면 조작됐을 수 있음)
-        print_report(outcome.comparison, safe_path(outcome.created_at), outcome.scanned_count)
+        print_report(outcome.comparison, display_time(outcome.created_at), outcome.scanned_count)
     elif refusal.kind == "snapshot_rejected":
         print_rejection(refusal.detail, tool_files)
     elif refusal.kind == "target_missing":
