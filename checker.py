@@ -39,15 +39,27 @@ EXIT_USAGE_ERROR         = 2   # 사용법 또는 입력 오류
 EXIT_VERIFICATION_FAILED = 3   # 스냅샷·키 검증 실패
 EXIT_SCAN_INCOMPLETE     = 4   # 일부 파일을 검사하지 못함
 
-# 파일명에 심어진 제어문자로 출력을 조작하는 것을 막습니다
-ANSI_ESCAPE   = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
-# C0·C1 제어문자, 그리고 글자 방향을 뒤집어 파일명을 위장하는 문자(U+202E 등)
-CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+# 파일명에 심어 화면을 속이거나 터미널을 조작할 수 있는 보이지 않는 문자
+#   - C0·C1 제어문자: ESC 로 시작하는 색상 코드, 0x9b(일부 터미널에서 ESC [ 와 같음), 줄바꿈 등
+#   - 글자 방향을 바꾸는 문자 (U+200E·200F, U+202A~202E, U+2066~2069)
+#   - 폭 0 문자 (U+200B~200D, U+2060, U+FEFF)
+HIDDEN_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]")
+
+
+def _visible(match: re.Match) -> str:
+    code = ord(match.group())
+    return f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}"
 
 
 def safe_path(path: str) -> str:
-    """파일 경로를 화면에 찍기 전에 제어문자를 제거합니다."""
-    return CONTROL_CHARS.sub("", ANSI_ESCAPE.sub("", path))
+    """
+    경로를 화면·기록에 찍기 전에 보이지 않는 문자를 눈에 보이는 표시('\\u202e' 등)로 바꿉니다.
+
+    지우지 않고 바꾸는 이유: 지우면 'ab<U+202E>.txt' 가 진짜 'ab.txt' 와 똑같이 보여
+    보고서가 어느 파일을 가리키는지 알 수 없게 됩니다. ESC 도 글자로 바뀌므로
+    색상 코드는 터미널이 해석하지 못하는 평범한 글자가 됩니다.
+    """
+    return HIDDEN_CHARS.sub(_visible, path)
 
 
 log = logging.getLogger(__name__)

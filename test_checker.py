@@ -38,19 +38,45 @@ def make_docs(tmp_path, files):
 
 
 # ─────────────────────────────────────────
-# 1. safe_path: 파일명을 화면에 찍기 전 정제
+# 1. safe_path: 파일명을 화면에 찍기 전 보이는 표시로 바꾸기
 # ─────────────────────────────────────────
+# 숨은 문자를 지우지 않고 '\u202e' 같은 글자로 바꾼다.
+# 지우면 서로 다른 두 파일이 화면에서 같은 이름으로 보인다.
 
-def test_파일명의_제어문자는_출력_전에_제거된다():
-    assert checker.safe_path("a\x1b[31mb\x07c") == "abc"
+def test_일반_파일명은_그대로_둔다():
     assert checker.safe_path("normal.txt") == "normal.txt"
+    assert checker.safe_path("계약서 최종본(2).hwp") == "계약서 최종본(2).hwp"
 
 
-def test_8비트_제어문자와_방향_전환_문자도_제거된다():
-    # U+202E 는 글자 방향을 뒤집어 'invoice\u202etxt.exe' 를 'invoiceexe.txt' 처럼 보이게 한다
-    assert checker.safe_path("invoice\u202etxt.exe") == "invoicetxt.exe"
+def test_색상_코드는_터미널이_해석하지_못하는_글자로_보인다():
+    assert checker.safe_path("a\x1b[31mb\x07c") == "a\\x1b[31mb\\x07c"
+
+
+def test_8비트_제어문자도_글자로_보인다():
     # \x9b 는 일부 터미널에서 ESC[ 와 같은 효과를 낸다
-    assert checker.safe_path("a\x9b31mb") == "a31mb"
+    assert checker.safe_path("a\x9b31mb") == "a\\x9b31mb"
+
+
+def test_줄바꿈과_탭도_글자로_보인다():
+    # 파일명에 줄바꿈이 있으면 보고서에 가짜 줄을 끼워 넣을 수 있다
+    assert checker.safe_path("a\nb\tc") == "a\\x0ab\\x09c"
+
+
+@pytest.mark.parametrize("hidden, shown", [
+    ("\u202e", "\\u202e"),   # 방향 뒤집기: 'invoice<U+202E>txt.exe' 가 'invoiceexe.txt' 처럼 보인다
+    ("\u2066", "\\u2066"),   # 방향 격리
+    ("\u200f", "\\u200f"),   # 방향 표시
+    ("\u200b", "\\u200b"),   # 폭 0 공백
+    ("\u2060", "\\u2060"),   # 폭 0 결합 방지
+    ("\ufeff", "\\ufeff"),   # 폭 0 (BOM)
+])
+def test_보이지_않는_문자는_그_자리에_표시된다(hidden, shown):
+    assert checker.safe_path(f"invoice{hidden}txt.exe") == f"invoice{shown}txt.exe"
+
+
+def test_숨은_문자가_든_이름과_진짜_이름은_구분된다():
+    assert checker.safe_path("a\u200bb.txt") != checker.safe_path("ab.txt")
+    assert checker.safe_path("a\u202eb.txt") != checker.safe_path("ab.txt")
 
 
 # ─────────────────────────────────────────
@@ -654,6 +680,19 @@ def test_시각이_아닌_값은_정제해서_그대로_보인다():
     shown = checker.display_time("\x1b[31m조작된 값")
     assert "\x1b" not in shown
     assert "조작된 값" in shown
+
+
+def test_보고서는_숨은_문자가_든_파일을_진짜_이름과_구분해_보여준다(tmp_path, capsys):
+    disguised = "ab\u202e.txt"
+    docs, tf = snapshot_docs(tmp_path, {disguised: "원본", "ab.txt": "원본"})
+    (docs / disguised).write_text("변조")
+    capsys.readouterr()
+
+    checker.verify_integrity(str(docs), tool_files=tf)
+
+    output = capsys.readouterr().out
+    assert "• ab\\u202e.txt" in output
+    assert "\u202e" not in output, "방향 바꾸기 문자가 그대로 화면에 나갔다"
 
 
 # ─────────────────────────────────────────
