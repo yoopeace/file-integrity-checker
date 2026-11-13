@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "file-integrity-checker"
+version = "1.0.0"
+description = "SHA-256 해시와 HMAC 서명 스냅샷으로 파일 변조·삭제·추가를 탐지하는 무결성 검사 도구"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = []
+
+[tool.setuptools]
+py-modules = ["checker"]

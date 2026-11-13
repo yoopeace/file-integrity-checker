@@ -38,6 +38,7 @@ SHA-256 해시를 이용해 파일의 변조, 삭제, 추가 여부를 탐지하
 | `checker.py` | 검사 로직과 CLI |
 | `test_checker.py`, `test_cli.py` | 테스트 |
 | `GLOSSARY.md` | 용어 정리 (스냅샷, 서명, 검사 실패 등) |
+| `pyproject.toml` | 패키지 설정. 다른 프로그램에서 `pip install "file-integrity-checker @ git+https://github.com/yoopeace/file-integrity-checker@v1.0.0"`로 불러 쓸 수 있음 |
 
 ---
 
