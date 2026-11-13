@@ -431,15 +431,37 @@ def print_key_unavailable(error, tool_files: ToolFiles) -> None:
     log.error(f"  비밀키 사용 불가: {error}")
 
 
-def create_snapshot(directory: str, exclude_dirs=(), tool_files: ToolFiles | None = None) -> int:
+# 기준선 만들기도 판단과 출력을 나눕니다 (검증의 run_verification / print_verify_outcome 과 같은 방식).
+#   make_snapshot          : 훑기 → 키 → 저장. 결과를 값(SnapshotOutcome)으로
+#   print_snapshot_outcome : 그 값을 화면에 그림
+#   create_snapshot        : 둘을 차례로 부르고 종료 코드를 돌려줌 (CLI 용)
+
+@dataclass(frozen=True)
+class SnapshotOutcome:
+    """기준선 만들기 한 번의 결과."""
+    failure: str | None       # None(성공) / "target_missing" / "scan_incomplete" / "key_unavailable" / "save_failed"
+    detail: object = None     # scan_incomplete: {경로: 이유}, key_unavailable: KeyUnavailable, save_failed: OSError
+    saved_count: int = 0      # 기록한 파일 수 (성공했을 때)
+    key_created: bool = False # 이번에 비밀키를 새로 만들었는지
+
+    @property
+    def exit_code(self) -> int:
+        return {
+            None: EXIT_OK,
+            "target_missing": EXIT_USAGE_ERROR,
+            "scan_incomplete": EXIT_SCAN_INCOMPLETE,
+            "key_unavailable": EXIT_VERIFICATION_FAILED,
+            "save_failed": EXIT_USAGE_ERROR,
+        }[self.failure]
+
+
+def make_snapshot(directory: str, exclude_dirs=(), tool_files: ToolFiles | None = None) -> SnapshotOutcome:
     """
-    현재 상태(해시 딕셔너리)를 서명해서 snapshot.json에 저장합니다.
-    이것이 나중에 비교할 '기준선(baseline)'이 됩니다.
+    현재 상태(해시 딕셔너리)를 서명해서 스냅샷 파일에 저장하고, 결과를 값으로 돌려줍니다.
+    이것이 나중에 비교할 '기준선(baseline)'이 됩니다. 화면에는 아무것도 출력하지 않습니다.
     """
     if not os.path.isdir(directory):
-        print(f"\n❌ 폴더를 찾을 수 없습니다: {safe_path(directory)}")
-        print("   경로를 다시 확인해 주세요.\n")
-        return EXIT_USAGE_ERROR
+        return SnapshotOutcome("target_missing", directory)
 
     tool_files = tool_files or ToolFiles()
     log.info(f"=== 스냅샷 생성 시작: {directory} ===")
@@ -447,34 +469,58 @@ def create_snapshot(directory: str, exclude_dirs=(), tool_files: ToolFiles | Non
 
     # 일부를 읽지 못한 상태로 기준선을 만들면 이후 검증 결과를 신뢰할 수 없습니다
     if scan.errors:
-        print(f"\n❌ 검사하지 못한 파일·폴더가 {len(scan.errors)}개 있어 스냅샷을 만들지 않았습니다.")
-        for path, reason in scan.errors.items():
-            print(f"   • {safe_path(path)} → {safe_path(reason)}")
-        print("   권한을 확인한 뒤 다시 시도해 주세요.\n")
         log.error(f"=== 스냅샷 중단: 검사 실패 {len(scan.errors)}건 ===")
-        return EXIT_SCAN_INCOMPLETE
+        return SnapshotOutcome("scan_incomplete", dict(scan.errors))
 
     try:
         key, key_created = key_for_signing(tool_files.key)
     except KeyUnavailable as e:
-        print_key_unavailable(e, tool_files)
-        return EXIT_VERIFICATION_FAILED
-    if key_created:
-        # 키를 다른 곳에 둘수록 어디에 만들어졌는지 놓치기 쉬우므로 화면에 알립니다
-        print(f"\n🔑 새 비밀키를 만들었습니다: {safe_path(tool_files.key)}")
-        print("   이 키가 있어야 검증할 수 있습니다. 검사 대상과 다른 곳에 안전하게 보관하세요.")
+        log.error(f"  비밀키 사용 불가: {e}")
+        return SnapshotOutcome("key_unavailable", e)
 
     try:
         save_snapshot(directory, scan.hashes, exclude_dirs, key, tool_files.snapshot)
     except OSError as e:
-        print(f"\n❌ 스냅샷을 저장하지 못했습니다: {e}")
-        print("   이전 스냅샷이 있었다면 그대로 남아 있습니다.\n")
         log.error(f"=== 스냅샷 저장 실패: {e} ===")
-        return EXIT_USAGE_ERROR
+        return SnapshotOutcome("save_failed", e, key_created=key_created)
 
     log.info(f"=== 스냅샷 완료: {len(scan.hashes)}개 파일 → {tool_files.snapshot} ===")
-    print(f"\n✅ 스냅샷 저장 완료: {len(scan.hashes)}개 파일이 기록되었습니다.")
-    return EXIT_OK
+    return SnapshotOutcome(None, saved_count=len(scan.hashes), key_created=key_created)
+
+
+def print_snapshot_outcome(outcome: SnapshotOutcome, tool_files: ToolFiles) -> None:
+    """기준선 만들기 결과를 화면에 그립니다."""
+    if outcome.failure == "target_missing":
+        print(f"\n❌ 폴더를 찾을 수 없습니다: {safe_path(outcome.detail)}")
+        print("   경로를 다시 확인해 주세요.\n")
+        return
+    if outcome.failure == "scan_incomplete":
+        print(f"\n❌ 검사하지 못한 파일·폴더가 {len(outcome.detail)}개 있어 스냅샷을 만들지 않았습니다.")
+        for path, reason in outcome.detail.items():
+            print(f"   • {safe_path(path)} → {safe_path(reason)}")
+        print("   권한을 확인한 뒤 다시 시도해 주세요.\n")
+        return
+    if outcome.failure == "key_unavailable":
+        print(f"\n❌ 비밀키를 사용할 수 없습니다: {outcome.detail}")
+        print(f"   {safe_path(tool_files.key)} 를 확인해 주세요.\n")
+        return
+    if outcome.key_created:
+        # 키를 다른 곳에 둘수록 어디에 만들어졌는지 놓치기 쉬우므로 화면에 알립니다
+        print(f"\n🔑 새 비밀키를 만들었습니다: {safe_path(tool_files.key)}")
+        print("   이 키가 있어야 검증할 수 있습니다. 검사 대상과 다른 곳에 안전하게 보관하세요.")
+    if outcome.failure == "save_failed":
+        print(f"\n❌ 스냅샷을 저장하지 못했습니다: {outcome.detail}")
+        print("   이전 스냅샷이 있었다면 그대로 남아 있습니다.\n")
+        return
+    print(f"\n✅ 스냅샷 저장 완료: {outcome.saved_count}개 파일이 기록되었습니다.")
+
+
+def create_snapshot(directory: str, exclude_dirs=(), tool_files: ToolFiles | None = None) -> int:
+    """기준선을 만들고 결과를 화면에 출력합니다 (CLI 용). 종료 코드를 돌려줍니다."""
+    tool_files = tool_files or ToolFiles()
+    outcome = make_snapshot(directory, exclude_dirs, tool_files)
+    print_snapshot_outcome(outcome, tool_files)
+    return outcome.exit_code
 
 
 # ─────────────────────────────────────────

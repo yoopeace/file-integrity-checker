@@ -373,6 +373,63 @@ def test_읽을_수_없는_검증용_키는_쓸_수_없다(tmp_path):
 # 5. create_snapshot: 기준선 만들기
 # ─────────────────────────────────────────
 
+# make_snapshot: 화면 출력 없이 결과를 값으로 (앱이 화면을 직접 그릴 수 있게)
+
+def test_기준선_만들기는_결과를_값으로_돌려준다(tmp_path, capsys):
+    docs = make_docs(tmp_path, {"a.txt": "내용"})
+
+    outcome = checker.make_snapshot(str(docs), tool_files=tool_files_in(tmp_path))
+
+    assert outcome == checker.SnapshotOutcome(None, saved_count=1, key_created=True)
+    assert outcome.exit_code == checker.EXIT_OK
+    assert capsys.readouterr().out == ""
+
+
+def test_키가_이미_있으면_새로_만들지_않았다고_알린다(tmp_path):
+    docs = make_docs(tmp_path, {"a.txt": "내용"})
+    tf = tool_files_in(tmp_path)
+    checker.make_snapshot(str(docs), tool_files=tf)
+
+    assert checker.make_snapshot(str(docs), tool_files=tf).key_created is False
+
+
+def test_없는_폴더면_target_missing(tmp_path):
+    outcome = checker.make_snapshot(str(tmp_path / "없음"), tool_files=tool_files_in(tmp_path))
+    assert (outcome.failure, outcome.exit_code) == ("target_missing", checker.EXIT_USAGE_ERROR)
+
+
+def test_읽지_못한_파일이_있으면_scan_incomplete(tmp_path):
+    docs = make_docs(tmp_path, {"a.txt": "내용", "blocked.txt": "비밀"})
+    (docs / "blocked.txt").chmod(0o000)
+    try:
+        outcome = checker.make_snapshot(str(docs), tool_files=tool_files_in(tmp_path))
+    finally:
+        (docs / "blocked.txt").chmod(0o644)
+    assert (outcome.failure, outcome.exit_code) == ("scan_incomplete", checker.EXIT_SCAN_INCOMPLETE)
+    assert "blocked.txt" in outcome.detail
+    assert not (tmp_path / checker.SNAPSHOT_FILE).exists()
+
+
+def test_빈_키_파일이면_key_unavailable(tmp_path):
+    docs = make_docs(tmp_path, {"a.txt": "내용"})
+    (tmp_path / checker.KEY_FILE).write_text("")
+
+    outcome = checker.make_snapshot(str(docs), tool_files=tool_files_in(tmp_path))
+
+    assert (outcome.failure, outcome.exit_code) == ("key_unavailable", checker.EXIT_VERIFICATION_FAILED)
+
+
+def test_저장하지_못하면_save_failed(tmp_path):
+    docs = make_docs(tmp_path, {"a.txt": "내용"})
+    tf = checker.ToolFiles(snapshot=str(tmp_path / "없는폴더" / checker.SNAPSHOT_FILE),
+                           log=str(tmp_path / checker.LOG_FILE), key=str(tmp_path / checker.KEY_FILE))
+
+    outcome = checker.make_snapshot(str(docs), tool_files=tf)
+
+    assert (outcome.failure, outcome.exit_code) == ("save_failed", checker.EXIT_USAGE_ERROR)
+    assert isinstance(outcome.detail, OSError)
+
+
 def test_스냅샷에_서명이_들어간다(tmp_path):
     tf = tool_files_in(tmp_path)
     make_docs(tmp_path, {"doc1.txt": "원본 내용"})
